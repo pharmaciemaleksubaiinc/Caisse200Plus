@@ -25,7 +25,7 @@ if not st.session_state.auth:
     st.title("Accès protégé")
     pwd = st.text_input("Mot de passe", type="password")
     app_password = st.secrets.get("APP_PASSWORD")
-    if st.button("Se connecter"):
+    if st.button("Se connecter", key="btn_login"):
         if not app_password:
             st.error("APP_PASSWORD manquant dans Streamlit secrets.")
             st.stop()
@@ -90,9 +90,11 @@ def clamp_locked(locked: dict, avail: dict) -> dict:
     out = {}
     for k, v in locked.items():
         v = safe_int(v, 0)
-        if v < 0: v = 0
+        if v < 0:
+            v = 0
         mx = safe_int(avail.get(k, 0), 0)
-        if v > mx: v = mx
+        if v > mx:
+            v = mx
         out[k] = v
     return out
 
@@ -113,9 +115,6 @@ def take_greedy(remaining: int, keys: list, avail: dict, out: dict, locked: dict
     return remaining
 
 def suggest_withdrawal(amount_cents: int, allowed: list, avail: dict, locked: dict, priority: list):
-    """
-    Suggest counts to withdraw 'amount_cents' from avail, respecting allowed + locked.
-    """
     out = {k: 0 for k in DENOMS}
 
     # apply locked first
@@ -124,11 +123,10 @@ def suggest_withdrawal(amount_cents: int, allowed: list, avail: dict, locked: di
 
     remaining = amount_cents - total_cents(out)
     if remaining < 0:
-        return out, remaining  # locked too high
+        return out, remaining
 
     allowed_set = set(allowed)
     keys = [k for k in priority if k in allowed_set]
-
     remaining = take_greedy(remaining, keys, avail, out, locked)
     return out, remaining
 
@@ -167,17 +165,17 @@ def load_receipt(folder: str, d: date):
 # ================== RECEIPTS (SEPARATE) ==================
 def receipt_html_caisse(meta: dict, rows: list) -> str:
     meta_html = "".join([f"<div><b>{k}:</b> {v}</div>" for k, v in meta.items()])
-
     body = ""
     for r in rows:
-        body += "<tr>" + "".join([
-            f"<td>{r.get('Dénomination','')}</td>",
-            f"<td style='text-align:center'>{r.get('OPEN','')}</td>",
-            f"<td style='text-align:center'>{r.get('CLOSE','')}</td>",
-            f"<td style='text-align:center'>{r.get('RETRAIT','')}</td>",
-            f"<td style='text-align:center'>{r.get('RESTANT','')}</td>",
-        ]) + "</tr>"
-
+        body += (
+            "<tr>"
+            f"<td>{r.get('Dénomination','')}</td>"
+            f"<td style='text-align:center'>{r.get('OPEN','')}</td>"
+            f"<td style='text-align:center'>{r.get('CLOSE','')}</td>"
+            f"<td style='text-align:center'>{r.get('RETRAIT','')}</td>"
+            f"<td style='text-align:center'>{r.get('RESTANT','')}</td>"
+            "</tr>"
+        )
     return f"""
     <html><head><meta charset="utf-8"/><title>Reçu — Caisse</title>
     <style>
@@ -208,17 +206,17 @@ def receipt_html_caisse(meta: dict, rows: list) -> str:
 
 def receipt_html_boite(meta: dict, rows: list) -> str:
     meta_html = "".join([f"<div><b>{k}:</b> {v}</div>" for k, v in meta.items()])
-
     body = ""
     for r in rows:
-        body += "<tr>" + "".join([
-            f"<td>{r.get('Dénomination','')}</td>",
-            f"<td style='text-align:center'>{r.get('Boîte (avant)','')}</td>",
-            f"<td style='text-align:center'>{r.get('Dépôt billets','')}</td>",
-            f"<td style='text-align:center'>{r.get('Change retiré','')}</td>",
-            f"<td style='text-align:center'>{r.get('Boîte (après)','')}</td>",
-        ]) + "</tr>"
-
+        body += (
+            "<tr>"
+            f"<td>{r.get('Dénomination','')}</td>"
+            f"<td style='text-align:center'>{r.get('Boîte (avant)','')}</td>"
+            f"<td style='text-align:center'>{r.get('Dépôt billets','')}</td>"
+            f"<td style='text-align:center'>{r.get('Change retiré','')}</td>"
+            f"<td style='text-align:center'>{r.get('Boîte (après)','')}</td>"
+            "</tr>"
+        )
     return f"""
     <html><head><meta charset="utf-8"/><title>Reçu — Boîte</title>
     <style>
@@ -255,7 +253,6 @@ def df_box_before_default():
     return pd.DataFrame([{"Dénomination": k, "Boîte (avant)": 0} for k in DISPLAY_ORDER])
 
 def df_box_deposit_default():
-    # deposit is mostly bills, but we’ll allow any denom if you want
     return pd.DataFrame([{"Dénomination": k, "Dépôt billets": 0} for k in DISPLAY_ORDER])
 
 # ================== SESSION STATE INIT ==================
@@ -266,14 +263,11 @@ def ensure_keys():
         "cashier": "",
         "register_no": 1,
         "target_dollars": 200,
-
         "df_register": df_register_default(),
         "df_box_before": df_box_before_default(),
         "df_box_deposit": df_box_deposit_default(),
-
         "locked_retrait_caisse": {},
         "locked_withdraw_boite": {},
-
         "last_hash_caisse": None,
         "last_hash_boite": None,
     }
@@ -283,29 +277,30 @@ def ensure_keys():
 
 ensure_keys()
 
-# Optional: load today's saved states if exist (both)
-saved_caisse = load_state(DIR_CAISSE, today)
-if saved_caisse and "booted_caisse_for" not in st.session_state:
-    st.session_state.booted_caisse_for = today
-    st.session_state.cashier = saved_caisse.get("meta", {}).get("Caissier(ère)", st.session_state.cashier)
-    st.session_state.register_no = safe_int(saved_caisse.get("meta", {}).get("Caisse #", st.session_state.register_no), 1)
-    st.session_state.target_dollars = safe_int(saved_caisse.get("meta", {}).get("Cible $", st.session_state.target_dollars), 200)
-    table = saved_caisse.get("register", {}).get("table")
-    if isinstance(table, list) and table:
-        st.session_state.df_register = pd.DataFrame(table)
-    st.session_state.locked_retrait_caisse = saved_caisse.get("register", {}).get("locked_retrait", {})
+# Load today's saved states (both) once per session/day
+if "booted_for" not in st.session_state or st.session_state.booted_for != today:
+    st.session_state.booted_for = today
 
-saved_boite = load_state(DIR_BOITE, today)
-if saved_boite and "booted_boite_for" not in st.session_state:
-    st.session_state.booted_boite_for = today
-    st.session_state.cashier = saved_boite.get("meta", {}).get("Caissier(ère)", st.session_state.cashier)
-    table_before = saved_boite.get("boite", {}).get("table_before")
-    table_deposit = saved_boite.get("boite", {}).get("table_deposit")
-    if isinstance(table_before, list) and table_before:
-        st.session_state.df_box_before = pd.DataFrame(table_before)
-    if isinstance(table_deposit, list) and table_deposit:
-        st.session_state.df_box_deposit = pd.DataFrame(table_deposit)
-    st.session_state.locked_withdraw_boite = saved_boite.get("boite", {}).get("locked_withdraw", {})
+    saved_caisse = load_state(DIR_CAISSE, today)
+    if saved_caisse:
+        st.session_state.cashier = saved_caisse.get("meta", {}).get("Caissier(ère)", st.session_state.cashier)
+        st.session_state.register_no = safe_int(saved_caisse.get("meta", {}).get("Caisse #", st.session_state.register_no), 1)
+        st.session_state.target_dollars = safe_int(saved_caisse.get("meta", {}).get("Cible $", st.session_state.target_dollars), 200)
+        table = saved_caisse.get("register", {}).get("table")
+        if isinstance(table, list) and table:
+            st.session_state.df_register = pd.DataFrame(table)
+        st.session_state.locked_retrait_caisse = saved_caisse.get("register", {}).get("locked_retrait", {})
+
+    saved_boite = load_state(DIR_BOITE, today)
+    if saved_boite:
+        st.session_state.cashier = saved_boite.get("meta", {}).get("Caissier(ère)", st.session_state.cashier)
+        table_before = saved_boite.get("boite", {}).get("table_before")
+        table_deposit = saved_boite.get("boite", {}).get("table_deposit")
+        if isinstance(table_before, list) and table_before:
+            st.session_state.df_box_before = pd.DataFrame(table_before)
+        if isinstance(table_deposit, list) and table_deposit:
+            st.session_state.df_box_deposit = pd.DataFrame(table_deposit)
+        st.session_state.locked_withdraw_boite = saved_boite.get("boite", {}).get("locked_withdraw", {})
 
 # ================== HEADER ==================
 st.title("Registre — Caisse & Boîte de monnaie")
@@ -316,11 +311,11 @@ with h1:
 with h2:
     st.write("**Heure:**", datetime.now(TZ).strftime("%H:%M"))
 with h3:
-    st.session_state.register_no = st.selectbox("Caisse #", [1, 2, 3], index=[1,2,3].index(st.session_state.register_no))
+    st.session_state.register_no = st.selectbox("Caisse #", [1, 2, 3], index=[1,2,3].index(st.session_state.register_no), key="sel_register")
 with h4:
-    st.session_state.cashier = st.text_input("Caissier(ère)", value=st.session_state.cashier)
+    st.session_state.cashier = st.text_input("Caissier(ère)", value=st.session_state.cashier, key="txt_cashier")
 with h5:
-    st.session_state.target_dollars = st.number_input("Cible à laisser ($)", min_value=0, step=10, value=int(st.session_state.target_dollars))
+    st.session_state.target_dollars = st.number_input("Cible à laisser ($)", min_value=0, step=10, value=int(st.session_state.target_dollars), key="num_target")
 
 st.divider()
 
@@ -329,7 +324,7 @@ tab_caisse, tab_boite, tab_save = st.tabs(["1) Caisse", "2) Boîte (Échange)", 
 
 # ================== TAB: CAISSE ==================
 with tab_caisse:
-    st.subheader("Caisse — Comptage OPEN/CLOSE (saisie stable, pas de reset)")
+    st.subheader("Caisse — Comptage OPEN/CLOSE (saisie stable)")
     with st.form("form_caisse", clear_on_submit=False):
         edited = st.data_editor(
             st.session_state.df_register,
@@ -343,7 +338,7 @@ with tab_caisse:
             },
             key="ed_register",
         )
-        submitted = st.form_submit_button("✅ Enregistrer comptage Caisse")
+        submitted = st.form_submit_button("✅ Enregistrer comptage Caisse", key="submit_caisse")
 
     if submitted:
         st.session_state.df_register = edited
@@ -364,17 +359,13 @@ with tab_caisse:
     st.divider()
     st.subheader("Retrait proposé (priorité gros billets) + ajustement ➖/➕")
 
-    # Allowed: for caisse, assume all allowed. If you want checkboxes again, we can add later.
     allowed = list(DISPLAY_ORDER)
-
-    # Suggest retrait
     retrait = {k: 0 for k in DENOMS}
     restant = dict(close_counts)
 
     if diff <= 0:
         st.warning("Sous la cible (ou égal).")
     else:
-        # Caisse priority: big bills then small then coins then rolls
         coins_desc = sorted(COINS, key=lambda x: DENOMS[x], reverse=True)
         rolls_desc = sorted(ROLLS, key=lambda x: DENOMS[x], reverse=True)
         priority_caisse = BILLS_BIG + BILLS_SMALL + coins_desc + rolls_desc
@@ -393,8 +384,7 @@ with tab_caisse:
         else:
             st.warning("Impossible exact. Reste: " + cents_to_str(remaining))
 
-        # Adjust lock via buttons (outside form)
-        if st.button("Reset ajustements retrait"):
+        if st.button("Reset ajustements retrait", key="btn_reset_caisse_locks"):
             st.session_state.locked_retrait_caisse = {}
             st.rerun()
 
@@ -425,7 +415,6 @@ with tab_caisse:
         restant = sub_counts(close_counts, retrait)
         st.info("RESTANT: " + cents_to_str(total_cents(restant)))
 
-    # Build caisse rows for receipt
     rows_caisse = []
     for k in DISPLAY_ORDER:
         rows_caisse.append({
@@ -461,12 +450,11 @@ with tab_caisse:
         },
     }
 
-    # Autosave caisse
-    h = hash_payload(payload_caisse)
-    if st.session_state.last_hash_caisse != h:
+    hc = hash_payload(payload_caisse)
+    if st.session_state.last_hash_caisse != hc:
         save_state(DIR_CAISSE, today, payload_caisse)
         save_receipt(DIR_CAISSE, today, receipt_html_caisse(meta_caisse, rows_caisse))
-        st.session_state.last_hash_caisse = h
+        st.session_state.last_hash_caisse = hc
 
     st.markdown("### Aperçu reçu — Caisse")
     components.html(receipt_html_caisse(meta_caisse, rows_caisse), height=620, scrolling=True)
@@ -474,7 +462,7 @@ with tab_caisse:
 # ================== TAB: BOÎTE (EXCHANGE) ==================
 with tab_boite:
     st.subheader("Boîte (Échange) — Dépôt billets → Retrait change")
-    st.caption("Tu saisis l’inventaire de la boîte (avant), puis le dépôt (billets). L’app propose le change à retirer (même valeur que le dépôt).")
+    st.caption("Saisis Boîte (avant), puis le dépôt. L’app propose le change à retirer (même valeur que le dépôt), priorité 20/10/5 puis pièces.")
 
     left, right = st.columns([1, 1])
 
@@ -492,7 +480,7 @@ with tab_boite:
                 },
                 key="ed_box_before",
             )
-            sub_before = st.form_submit_button("✅ Enregistrer Boîte (avant)")
+            sub_before = st.form_submit_button("✅ Enregistrer Boîte (avant)", key="submit_boite_before")
         if sub_before:
             st.session_state.df_box_before = edited_before
 
@@ -510,7 +498,7 @@ with tab_boite:
                 },
                 key="ed_box_deposit",
             )
-            sub_dep = st.form_submit_button("✅ Enregistrer Dépôt")
+            sub_dep = st.form_submit_button("✅ Enregistrer Dépôt", key="submit_boite_deposit")
         if sub_dep:
             st.session_state.df_box_deposit = edited_deposit
 
@@ -526,42 +514,45 @@ with tab_boite:
     s3.write("**Change à retirer (objectif):** " + f"**{cents_to_str(total_deposit)}**")
 
     st.divider()
-    st.subheader("Change retiré proposé (priorité petits billets + pièces) + ajustements ➖/➕")
+    st.subheader("Change retiré proposé + ajustements ➖/➕")
 
-    # Available for withdrawal is the box after deposit (before removing change)
     box_after_deposit = add_counts(box_before, deposit)
 
-    # Priority asked: 20,10,5,2,1,0.25,0.10,0.05 then rolls then 50/100 last
-    coins_order = ["Pièce 2 $", "Pièce 1 $", "Pièce 0,25 $", "Pièce 0,10 $", "Pièce 0,05 $"]
-    priority_boite = ["Billet 20 $", "Billet 10 $", "Billet 5 $"] + coins_order + ROLLS + ["Billet 50 $", "Billet 100 $"]
+    priority_boite = (
+        ["Billet 20 $", "Billet 10 $", "Billet 5 $"] +
+        ["Pièce 2 $", "Pièce 1 $", "Pièce 0,25 $", "Pièce 0,10 $", "Pièce 0,05 $"] +
+        ROLLS +
+        ["Billet 50 $", "Billet 100 $"]
+    )
 
     allowed_boite = list(DISPLAY_ORDER)
+    withdraw = {k: 0 for k in DENOMS}
+    remaining = 0
 
     st.session_state.locked_withdraw_boite = clamp_locked(st.session_state.locked_withdraw_boite, box_after_deposit)
-
-    withdraw, remaining = suggest_withdrawal(
-        total_deposit,
-        allowed_boite,
-        box_after_deposit,
-        dict(st.session_state.locked_withdraw_boite),
-        priority_boite
-    )
 
     if total_deposit == 0:
         st.warning("Dépôt = 0. Rien à calculer.")
     else:
+        withdraw, remaining = suggest_withdrawal(
+            total_deposit,
+            allowed_boite,
+            box_after_deposit,
+            dict(st.session_state.locked_withdraw_boite),
+            priority_boite,
+        )
+
         if remaining == 0:
             st.success("Change retiré: " + cents_to_str(total_cents(withdraw)))
         elif remaining < 0:
-            st.warning("Verrouillage trop haut. Tu dépasses de " + cents_to_str(-remaining))
+            st.warning("Verrouillage trop haut. Dépasse de " + cents_to_str(-remaining))
         else:
             st.warning("Impossible exact. Reste: " + cents_to_str(remaining))
 
-    if st.button("Reset ajustements (boîte)"):
+    if st.button("Reset ajustements (boîte)", key="btn_reset_boite_locks"):
         st.session_state.locked_withdraw_boite = {}
         st.rerun()
 
-    # Adjust withdraw locks
     keys = DISPLAY_ORDER
     for i in range(0, len(keys), 4):
         row = st.columns(4)
@@ -588,7 +579,6 @@ with tab_boite:
     box_after = sub_counts(box_after_deposit, withdraw)
     st.info("Boîte (après échange): " + cents_to_str(total_cents(box_after)))
 
-    # Build rows for box receipt (separate)
     rows_boite = []
     for k in DISPLAY_ORDER:
         rows_boite.append({
@@ -625,7 +615,6 @@ with tab_boite:
         }
     }
 
-    # Autosave boite (separate folder)
     hb = hash_payload(payload_boite)
     if st.session_state.last_hash_boite != hb:
         save_state(DIR_BOITE, today, payload_boite)
@@ -652,20 +641,34 @@ with tab_save:
                 d = date.fromisoformat(ds)
                 title = f"{ds} — Reçu Caisse"
                 with st.expander(title, expanded=False):
-                    html, html_path = load_receipt(DIR_CAISSE, d)
+                    html, _ = load_receipt(DIR_CAISSE, d)
+                    rp = os.path.join(DIR_CAISSE, f"{ds}_receipt.html")
+                    sp = os.path.join(DIR_CAISSE, f"{ds}_state.json")
+
                     if html:
                         components.html(html, height=640, scrolling=True)
-                        # downloads
-                        rp = os.path.join(DIR_CAISSE, f"{ds}_receipt.html")
-                        sp = os.path.join(DIR_CAISSE, f"{ds}_state.json")
-                        if os.path.exists(rp):
-                            with open(rp, "rb") as f:
-                                st.download_button("⬇️ Télécharger reçu (HTML)", f, file_name=os.path.basename(rp), mime="text/html")
-                        if os.path.exists(sp):
-                            with open(sp, "rb") as f:
-                                st.download_button("⬇️ Télécharger état (JSON)", f, file_name=os.path.basename(sp), mime="application/json")
                     else:
                         st.warning("Reçu introuvable pour cette date.")
+
+                    # DOWNLOADS (unique keys = no more StreamlitDuplicateElementId)
+                    if os.path.exists(rp):
+                        with open(rp, "rb") as f:
+                            st.download_button(
+                                "⬇️ Télécharger reçu (HTML)",
+                                data=f.read(),
+                                file_name=os.path.basename(rp),
+                                mime="text/html",
+                                key=f"dl_caisse_html_{ds}",
+                            )
+                    if os.path.exists(sp):
+                        with open(sp, "rb") as f:
+                            st.download_button(
+                                "⬇️ Télécharger état (JSON)",
+                                data=f.read(),
+                                file_name=os.path.basename(sp),
+                                mime="application/json",
+                                key=f"dl_caisse_json_{ds}",
+                            )
 
     with colB:
         st.markdown("## 🪙 Boîte (Échange)")
@@ -677,17 +680,31 @@ with tab_save:
                 d = date.fromisoformat(ds)
                 title = f"{ds} — Reçu Boîte (Échange)"
                 with st.expander(title, expanded=False):
-                    html, html_path = load_receipt(DIR_BOITE, d)
+                    html, _ = load_receipt(DIR_BOITE, d)
+                    rp = os.path.join(DIR_BOITE, f"{ds}_receipt.html")
+                    sp = os.path.join(DIR_BOITE, f"{ds}_state.json")
+
                     if html:
                         components.html(html, height=640, scrolling=True)
-                        # downloads
-                        rp = os.path.join(DIR_BOITE, f"{ds}_receipt.html")
-                        sp = os.path.join(DIR_BOITE, f"{ds}_state.json")
-                        if os.path.exists(rp):
-                            with open(rp, "rb") as f:
-                                st.download_button("⬇️ Télécharger reçu (HTML)", f, file_name=os.path.basename(rp), mime="text/html")
-                        if os.path.exists(sp):
-                            with open(sp, "rb") as f:
-                                st.download_button("⬇️ Télécharger état (JSON)", f, file_name=os.path.basename(sp), mime="application/json")
                     else:
                         st.warning("Reçu introuvable pour cette date.")
+
+                    # DOWNLOADS (unique keys)
+                    if os.path.exists(rp):
+                        with open(rp, "rb") as f:
+                            st.download_button(
+                                "⬇️ Télécharger reçu (HTML)",
+                                data=f.read(),
+                                file_name=os.path.basename(rp),
+                                mime="text/html",
+                                key=f"dl_boite_html_{ds}",
+                            )
+                    if os.path.exists(sp):
+                        with open(sp, "rb") as f:
+                            st.download_button(
+                                "⬇️ Télécharger état (JSON)",
+                                data=f.read(),
+                                file_name=os.path.basename(sp),
+                                mime="application/json",
+                                key=f"dl_boite_json_{ds}",
+                            )
