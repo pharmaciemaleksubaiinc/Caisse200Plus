@@ -1,11 +1,11 @@
 # caisse200+.py
 # Registre — Caisse & Boîte (Échange)
-# - Layout wide (horizontal)
 # - 3 tabs: CAISSE / BOÎTE / SAUVEGARDE
-# - Autosave daily (JSON state + printable HTML receipt)
-# - Receipts separated for Caisse vs Boîte, saved in different folders
-# - No st.form (prevents "type twice / reset to zero" & missing submit issues)
-# - Robust schema migration for old saved tables (fixes KeyError: "Dépôt")
+# - Autosave daily: JSON state + HTML receipt (printable)
+# - Tables show computed columns on the same line (like report)
+# - +/- adjustments for suggested withdraw on both tabs
+# - Boîte: choose allowed denominations via checkboxes
+# - Fix: "type then Enter resets to 0" by using LIVE normalisation (no reindex wipe mid-edit)
 
 import os
 import json
@@ -137,22 +137,27 @@ def take_greedy(remaining: int, keys: list, avail: dict, out: dict, locked: dict
     return remaining
 
 
-def suggest_withdrawal(amount_cents: int, avail: dict, locked: dict, priority: list):
+def suggest_withdrawal(amount_cents: int, allowed: list, avail: dict, locked: dict, priority: list):
     """
     Returns (withdraw_counts, remaining_cents)
-    - withdraw respects avail and locked.
+    - withdraw respects avail and locked
+    - only uses denominations present in allowed list
     """
     out = {k: 0 for k in DENOMS}
+    locked = locked or {}
 
-    # apply locked first
-    for k, q in (locked or {}).items():
+    # Apply locked first (even if not allowed, we still respect it to avoid weird jumps)
+    for k, q in locked.items():
         out[k] = safe_int(q)
 
     remaining = amount_cents - total_cents(out)
     if remaining < 0:
         return out, remaining
 
-    remaining = take_greedy(remaining, priority, avail, out, locked or {})
+    allowed_set = set(allowed)
+    prio = [k for k in priority if k in allowed_set]
+
+    remaining = take_greedy(remaining, prio, avail, out, locked)
     return out, remaining
 
 
@@ -238,112 +243,134 @@ def receipt_html(title: str, meta: dict, headers: list, rows: list) -> str:
 
 
 # ================== DEFAULT TABLES ==================
-def df_register_default():
-    return pd.DataFrame([{"Dénomination": k, "OPEN": 0, "CLOSE": 0} for k in DISPLAY_ORDER])
+def df_caisse_default():
+    # schema displayed: Dénomination, OPEN, CLOSE, RETRAIT, RESTANT
+    return pd.DataFrame([{"Dénomination": k, "OPEN": 0, "CLOSE": 0, "RETRAIT": 0, "RESTANT": 0} for k in DISPLAY_ORDER])
 
 
-def df_box_before_default():
-    return pd.DataFrame([{"Dénomination": k, "Boîte (avant)": 0} for k in DISPLAY_ORDER])
+def df_boite_default():
+    # schema displayed: Dénomination, Boîte (avant), Dépôt, Change retiré, Boîte (après)
+    return pd.DataFrame([{
+        "Dénomination": k,
+        "Boîte (avant)": 0,
+        "Dépôt": 0,
+        "Change retiré": 0,
+        "Boîte (après)": 0
+    } for k in DISPLAY_ORDER])
 
 
-def df_box_deposit_default():
-    # Schema: ["Dénomination", "Dépôt"]
-    return pd.DataFrame([{"Dénomination": k, "Dépôt": 0} for k in DISPLAY_ORDER])
-
-
-# ================== SCHEMA NORMALISERS (CRITICAL) ==================
-def normalize_register_df(df: pd.DataFrame) -> pd.DataFrame:
-    # Ensure schema: ["Dénomination", "OPEN", "CLOSE"]
+# ================== NORMALISATION ==================
+# Strict for LOAD (reindex to DISPLAY_ORDER, ensures columns exist)
+def normalize_caisse_df_load(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-        return df_register_default()
+        return df_caisse_default()
     df = df.copy()
-    if "Dénomination" not in df.columns:
-        return df_register_default()
 
-    # tolerate older/alternate column names
-    rename_map = {
-        "Open": "OPEN",
-        "Close": "CLOSE",
-        "OUVERTURE": "OPEN",
-        "FERMETURE": "CLOSE",
-    }
+    # tolerate older columns
+    rename_map = {"Open": "OPEN", "Close": "CLOSE", "Retrait": "RETRAIT", "Restant": "RESTANT"}
     df.rename(columns={c: rename_map[c] for c in df.columns if c in rename_map}, inplace=True)
 
-    if "OPEN" not in df.columns:
-        df["OPEN"] = 0
-    if "CLOSE" not in df.columns:
-        df["CLOSE"] = 0
+    if "Dénomination" not in df.columns:
+        return df_caisse_default()
+    for col in ["OPEN", "CLOSE", "RETRAIT", "RESTANT"]:
+        if col not in df.columns:
+            df[col] = 0
 
-    df = df[["Dénomination", "OPEN", "CLOSE"]]
+    df = df[["Dénomination", "OPEN", "CLOSE", "RETRAIT", "RESTANT"]]
     df["Dénomination"] = df["Dénomination"].astype(str)
-
     df = df.set_index("Dénomination").reindex(DISPLAY_ORDER).fillna(0).reset_index()
-    df["OPEN"] = pd.to_numeric(df["OPEN"], errors="coerce").fillna(0).astype(int)
-    df["CLOSE"] = pd.to_numeric(df["CLOSE"], errors="coerce").fillna(0).astype(int)
+
+    for col in ["OPEN", "CLOSE", "RETRAIT", "RESTANT"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
     return df
 
 
-def normalize_box_before_df(df: pd.DataFrame) -> pd.DataFrame:
-    # Ensure schema: ["Dénomination", "Boîte (avant)"]
+def normalize_boite_df_load(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-        return df_box_before_default()
+        return df_boite_default()
     df = df.copy()
-    if "Dénomination" not in df.columns:
-        return df_box_before_default()
 
     rename_map = {
         "Boite (avant)": "Boîte (avant)",
-        "Box (before)": "Boîte (avant)",
-    }
-    df.rename(columns={c: rename_map[c] for c in df.columns if c in rename_map}, inplace=True)
-
-    if "Boîte (avant)" not in df.columns:
-        df["Boîte (avant)"] = 0
-
-    df = df[["Dénomination", "Boîte (avant)"]]
-    df["Dénomination"] = df["Dénomination"].astype(str)
-    df = df.set_index("Dénomination").reindex(DISPLAY_ORDER).fillna(0).reset_index()
-    df["Boîte (avant)"] = pd.to_numeric(df["Boîte (avant)"], errors="coerce").fillna(0).astype(int)
-    return df
-
-
-def normalize_box_deposit_df(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Accepts old/new versions of deposit table and returns schema:
-    columns: ["Dénomination", "Dépôt"]
-    Fixes KeyError: 'Dépôt' when older saved tables used 'Dépôt billets' etc.
-    """
-    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-        return df_box_deposit_default()
-
-    df = df.copy()
-
-    rename_map = {
         "Depot": "Dépôt",
         "Dépôt billets": "Dépôt",
-        "DEPOT": "Dépôt",
-        "DEPOSIT": "Dépôt",
-        "Dépots": "Dépôt",
-        "Dépôt billet": "Dépôt",
+        "Après": "Boîte (après)",
+        "Change": "Change retiré",
     }
     df.rename(columns={c: rename_map[c] for c in df.columns if c in rename_map}, inplace=True)
 
     if "Dénomination" not in df.columns:
-        return df_box_deposit_default()
+        return df_boite_default()
 
-    if "Dépôt" not in df.columns:
-        df["Dépôt"] = 0
+    for col in ["Boîte (avant)", "Dépôt", "Change retiré", "Boîte (après)"]:
+        if col not in df.columns:
+            df[col] = 0
 
-    df = df[["Dénomination", "Dépôt"]]
+    df = df[["Dénomination", "Boîte (avant)", "Dépôt", "Change retiré", "Boîte (après)"]]
     df["Dénomination"] = df["Dénomination"].astype(str)
     df = df.set_index("Dénomination").reindex(DISPLAY_ORDER).fillna(0).reset_index()
-    df["Dépôt"] = pd.to_numeric(df["Dépôt"], errors="coerce").fillna(0).astype(int)
+
+    for col in ["Boîte (avant)", "Dépôt", "Change retiré", "Boîte (après)"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
     return df
 
 
-# ================== SESSION INIT ==================
-today = datetime.now(TZ).date()
+# LIVE for editor (DO NOT reindex aggressively; avoids wiping edits on Enter)
+def normalize_caisse_df_live(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df_caisse_default()
+    df = df.copy()
 
+    if "Dénomination" not in df.columns:
+        return df_caisse_default()
+
+    for col in ["OPEN", "CLOSE"]:
+        if col not in df.columns:
+            df[col] = 0
+
+    # keep computed cols if present
+    for col in ["RETRAIT", "RESTANT"]:
+        if col not in df.columns:
+            df[col] = 0
+
+    # do NOT reindex; just coerce numeric safely
+    for col in ["OPEN", "CLOSE", "RETRAIT", "RESTANT"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+
+    # ensure denom values are strings
+    df["Dénomination"] = df["Dénomination"].astype(str)
+    return df
+
+
+def normalize_boite_df_live(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df_boite_default()
+    df = df.copy()
+
+    # tolerate older deposit name mid-session
+    if "Dépôt" not in df.columns and "Dépôt billets" in df.columns:
+        df.rename(columns={"Dépôt billets": "Dépôt"}, inplace=True)
+
+    if "Dénomination" not in df.columns:
+        return df_boite_default()
+
+    for col in ["Boîte (avant)", "Dépôt"]:
+        if col not in df.columns:
+            df[col] = 0
+    for col in ["Change retiré", "Boîte (après)"]:
+        if col not in df.columns:
+            df[col] = 0
+
+    # do NOT reindex; just coerce numeric safely
+    for col in ["Boîte (avant)", "Dépôt", "Change retiré", "Boîte (après)"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+
+    df["Dénomination"] = df["Dénomination"].astype(str)
+    return df
+
+
+# ================== STATE INIT ==================
+today = datetime.now(TZ).date()
 
 def ensure_state():
     defaults = {
@@ -351,11 +378,16 @@ def ensure_state():
         "cashier": "",
         "register_no": 1,
         "target_dollars": 200,
-        "df_register": df_register_default(),
-        "df_box_before": df_box_before_default(),
-        "df_box_deposit": df_box_deposit_default(),
+
+        "df_caisse": df_caisse_default(),
+        "df_boite": df_boite_default(),
+
         "locked_retrait_caisse": {},
         "locked_withdraw_boite": {},
+
+        # allowed types for boîte (default: small bills + coins + rolls)
+        "boite_allowed": set(["Billet 20 $", "Billet 10 $", "Billet 5 $"] + COINS + ROLLS),
+
         "last_hash_caisse": None,
         "last_hash_boite": None,
     }
@@ -363,10 +395,9 @@ def ensure_state():
         if k not in st.session_state:
             st.session_state[k] = v
 
-
 ensure_state()
 
-# Load today's saved states once per day
+# Load today's saved state once per day
 if st.session_state.booted_for != today:
     st.session_state.booted_for = today
 
@@ -378,27 +409,24 @@ if st.session_state.booted_for != today:
 
         table = sc.get("register", {}).get("table")
         if isinstance(table, list) and table:
-            st.session_state.df_register = normalize_register_df(pd.DataFrame(table))
+            st.session_state.df_caisse = normalize_caisse_df_load(pd.DataFrame(table))
         st.session_state.locked_retrait_caisse = sc.get("register", {}).get("locked_retrait", {}) or {}
 
     sb = load_state(DIR_BOITE, today)
     if sb:
         st.session_state.cashier = sb.get("meta", {}).get("Caissier(ère)", st.session_state.cashier)
-
-        tb = sb.get("boite", {}).get("table_before")
-        td = sb.get("boite", {}).get("table_deposit")
-
-        if isinstance(tb, list) and tb:
-            st.session_state.df_box_before = normalize_box_before_df(pd.DataFrame(tb))
-        if isinstance(td, list) and td:
-            st.session_state.df_box_deposit = normalize_box_deposit_df(pd.DataFrame(td))
-
+        table = sb.get("boite", {}).get("table")
+        if isinstance(table, list) and table:
+            st.session_state.df_boite = normalize_boite_df_load(pd.DataFrame(table))
         st.session_state.locked_withdraw_boite = sb.get("boite", {}).get("locked_withdraw", {}) or {}
 
-# Always normalise current in-session tables (covers any weirdness)
-st.session_state.df_register = normalize_register_df(st.session_state.df_register)
-st.session_state.df_box_before = normalize_box_before_df(st.session_state.df_box_before)
-st.session_state.df_box_deposit = normalize_box_deposit_df(st.session_state.df_box_deposit)
+        allowed = sb.get("boite", {}).get("allowed_denoms")
+        if isinstance(allowed, list) and allowed:
+            st.session_state.boite_allowed = set(allowed)
+
+# Always keep in-session tables sane (LIVE normalisation)
+st.session_state.df_caisse = normalize_caisse_df_live(st.session_state.df_caisse)
+st.session_state.df_boite = normalize_boite_df_live(st.session_state.df_boite)
 
 
 # ================== HEADER ==================
@@ -428,16 +456,16 @@ with h5:
     )
 
 st.divider()
-
 tab_caisse, tab_boite, tab_save = st.tabs(["1) Caisse", "2) Boîte (Échange)", "3) Sauvegarde & reçus"])
 
 
 # ================== TAB: CAISSE ==================
 with tab_caisse:
-    st.subheader("Caisse — Comptage OPEN/CLOSE (saisie stable)")
+    st.subheader("Caisse — OPEN/CLOSE + RETRAIT + RESTANT (même ligne)")
 
+    # Edit OPEN/CLOSE in the same table; computed columns locked (disabled)
     edited = st.data_editor(
-        st.session_state.df_register,
+        st.session_state.df_caisse,
         hide_index=True,
         use_container_width=True,
         height=520,
@@ -445,13 +473,16 @@ with tab_caisse:
             "Dénomination": st.column_config.TextColumn(disabled=True),
             "OPEN": st.column_config.NumberColumn(min_value=0, step=1),
             "CLOSE": st.column_config.NumberColumn(min_value=0, step=1),
+            "RETRAIT": st.column_config.NumberColumn(disabled=True),
+            "RESTANT": st.column_config.NumberColumn(disabled=True),
         },
-        key="ed_register",
+        key="ed_caisse",
     )
-    st.session_state.df_register = normalize_register_df(edited)
+    st.session_state.df_caisse = normalize_caisse_df_live(edited)
 
-    open_counts = {r["Dénomination"]: safe_int(r["OPEN"]) for _, r in st.session_state.df_register.iterrows()}
-    close_counts = {r["Dénomination"]: safe_int(r["CLOSE"]) for _, r in st.session_state.df_register.iterrows()}
+    # Build counts
+    open_counts = {r["Dénomination"]: safe_int(r["OPEN"]) for _, r in st.session_state.df_caisse.iterrows()}
+    close_counts = {r["Dénomination"]: safe_int(r["CLOSE"]) for _, r in st.session_state.df_caisse.iterrows()}
 
     total_open = total_cents(open_counts)
     total_close = total_cents(close_counts)
@@ -463,30 +494,44 @@ with tab_caisse:
     b.success("TOTAL CLOSE: " + cents_to_str(total_close))
     c.write("**À retirer:** " + f"**{cents_to_str(diff)}**")
 
-    st.divider()
-    st.subheader("Retrait proposé (favorise gros billets) + ajustement ➖/➕")
-
+    # Suggest retrait (favorise gros billets)
     retrait = {k: 0 for k in DENOMS}
     restant = dict(close_counts)
+    remaining = 0
 
-    if diff <= 0:
-        st.warning("Sous la cible (ou égal).")
-    else:
+    if diff > 0:
         coins_desc = sorted(COINS, key=lambda x: DENOMS[x], reverse=True)
         rolls_desc = sorted(ROLLS, key=lambda x: DENOMS[x], reverse=True)
         priority_caisse = BILLS_BIG + BILLS_SMALL + coins_desc + rolls_desc
 
         st.session_state.locked_retrait_caisse = clamp_locked(st.session_state.locked_retrait_caisse, close_counts)
 
+        # allowed: all denoms
         retrait, remaining = suggest_withdrawal(
             diff,
-            close_counts,
-            dict(st.session_state.locked_retrait_caisse),
-            priority_caisse,
+            allowed=DISPLAY_ORDER,
+            avail=close_counts,
+            locked=dict(st.session_state.locked_retrait_caisse),
+            priority=priority_caisse,
         )
+        restant = sub_counts(close_counts, retrait)
 
+    # Update computed columns in the table (no reindex wipe)
+    df = st.session_state.df_caisse.copy()
+    df["RETRAIT"] = df["Dénomination"].map(lambda k: safe_int(retrait.get(k, 0)))
+    df["RESTANT"] = df["Dénomination"].map(lambda k: safe_int(restant.get(k, 0)))
+    st.session_state.df_caisse = normalize_caisse_df_live(df)
+
+    st.divider()
+    st.subheader("Ajuster le retrait (➖/➕)")
+
+    if diff <= 0:
+        st.warning("Sous la cible (ou égal). Aucun retrait nécessaire.")
+    else:
         if remaining == 0:
             st.success("Retrait proposé: " + cents_to_str(total_cents(retrait)))
+        elif remaining < 0:
+            st.warning("Verrouillage trop haut. Dépasse de " + cents_to_str(-remaining))
         else:
             st.warning("Impossible exact. Reste: " + cents_to_str(remaining))
 
@@ -494,11 +539,11 @@ with tab_caisse:
             st.session_state.locked_retrait_caisse = {}
             st.rerun()
 
-        # +/- grid (more horizontal)
+        # +/- grid
         keys = DISPLAY_ORDER
         for i in range(0, len(keys), 5):
             row = st.columns(5)
-            for j, k in enumerate(keys[i : i + 5]):
+            for j, k in enumerate(keys[i:i+5]):
                 with row[j]:
                     q = safe_int(retrait.get(k, 0))
                     mx = safe_int(close_counts.get(k, 0))
@@ -519,29 +564,23 @@ with tab_caisse:
                         st.session_state.locked_retrait_caisse = new_locked
                         st.rerun()
 
-        restant = sub_counts(close_counts, retrait)
-        st.info("RESTANT: " + cents_to_str(total_cents(restant)))
-
+    # Receipt rows (same as table + TOTAL)
     rows_caisse = []
     for k in DISPLAY_ORDER:
-        rows_caisse.append(
-            {
-                "Dénomination": k,
-                "OPEN": safe_int(open_counts.get(k, 0)),
-                "CLOSE": safe_int(close_counts.get(k, 0)),
-                "RETRAIT": safe_int(retrait.get(k, 0)),
-                "RESTANT": safe_int(restant.get(k, 0)),
-            }
-        )
-    rows_caisse.append(
-        {
-            "Dénomination": "TOTAL ($)",
-            "OPEN": f"{total_open/100:.2f}",
-            "CLOSE": f"{total_close/100:.2f}",
-            "RETRAIT": f"{total_cents(retrait)/100:.2f}",
-            "RESTANT": f"{total_cents(restant)/100:.2f}",
-        }
-    )
+        rows_caisse.append({
+            "Dénomination": k,
+            "OPEN": safe_int(open_counts.get(k, 0)),
+            "CLOSE": safe_int(close_counts.get(k, 0)),
+            "RETRAIT": safe_int(retrait.get(k, 0)),
+            "RESTANT": safe_int(restant.get(k, 0)),
+        })
+    rows_caisse.append({
+        "Dénomination": "TOTAL ($)",
+        "OPEN": f"{total_open/100:.2f}",
+        "CLOSE": f"{total_close/100:.2f}",
+        "RETRAIT": f"{total_cents(retrait)/100:.2f}",
+        "RESTANT": f"{total_cents(restant)/100:.2f}",
+    })
 
     meta_caisse = {
         "Type": "CAISSE",
@@ -555,78 +594,70 @@ with tab_caisse:
     payload_caisse = {
         "meta": meta_caisse,
         "register": {
-            "table": st.session_state.df_register.to_dict("records"),
+            "table": st.session_state.df_caisse.to_dict("records"),
             "locked_retrait": st.session_state.locked_retrait_caisse,
             "rows": rows_caisse,
         },
     }
 
-    # autosave caisse
+    # Autosave
     hc = hash_payload(payload_caisse)
     if st.session_state.last_hash_caisse != hc:
-        html = receipt_html(
-            "Reçu — Caisse",
-            meta_caisse,
-            ["Dénomination", "OPEN", "CLOSE", "RETRAIT", "RESTANT"],
-            rows_caisse,
-        )
+        html = receipt_html("Reçu — Caisse", meta_caisse, ["Dénomination", "OPEN", "CLOSE", "RETRAIT", "RESTANT"], rows_caisse)
         save_state(DIR_CAISSE, today, payload_caisse)
         save_receipt(DIR_CAISSE, today, html)
         st.session_state.last_hash_caisse = hc
 
     st.markdown("### Aperçu reçu — Caisse")
-    components.html(
-        receipt_html("Reçu — Caisse", meta_caisse, ["Dénomination", "OPEN", "CLOSE", "RETRAIT", "RESTANT"], rows_caisse),
-        height=620,
-        scrolling=True,
-    )
+    components.html(receipt_html("Reçu — Caisse", meta_caisse, ["Dénomination", "OPEN", "CLOSE", "RETRAIT", "RESTANT"], rows_caisse), height=620, scrolling=True)
 
 
-# ================== TAB: BOÎTE (ÉCHANGE) ==================
+# ================== TAB: BOÎTE ==================
 with tab_boite:
-    st.subheader("Boîte (Échange) — Dépôt billets → Retrait change")
-    st.caption("Tu saisis l’inventaire de la boîte (avant), puis le dépôt. L’app retire du change pour la même valeur. Priorité: 20/10/5 puis pièces.")
+    st.subheader("Boîte (Échange) — Boîte (avant) + Dépôt + Change retiré + Boîte (après) (même ligne)")
+    st.caption("Choisis les types de change autorisés, saisis Boîte (avant) et Dépôt. L’app propose le change à retirer (valeur = dépôt).")
 
-    left, right = st.columns(2)
+    # Allowed checkboxes (separate container so it doesn't mess with the editor state)
+    with st.expander("⚙️ Types autorisés pour le change (cocher/décocher)", expanded=True):
+        allowed = set(st.session_state.boite_allowed)
 
-    with left:
-        st.markdown("#### Boîte (avant) — Inventaire")
-        edited_before = st.data_editor(
-            st.session_state.df_box_before,
-            hide_index=True,
-            use_container_width=True,
-            height=420,
-            column_config={
-                "Dénomination": st.column_config.TextColumn(disabled=True),
-                "Boîte (avant)": st.column_config.NumberColumn(min_value=0, step=1),
-            },
-            key="ed_box_before",
-        )
-        st.session_state.df_box_before = normalize_box_before_df(edited_before)
+        # Present in 3 columns for horizontal layout
+        c1, c2, c3 = st.columns(3)
+        cols = [c1, c2, c3]
+        for i, k in enumerate(DISPLAY_ORDER):
+            with cols[i % 3]:
+                checked = k in allowed
+                if st.checkbox(k, value=checked, key=f"allow_boite_{k}"):
+                    allowed.add(k)
+                else:
+                    allowed.discard(k)
 
-    with right:
-        st.markdown("#### Dépôt (ce que tu mets dans la boîte)")
-        edited_deposit = st.data_editor(
-            st.session_state.df_box_deposit,
-            hide_index=True,
-            use_container_width=True,
-            height=420,
-            column_config={
-                "Dénomination": st.column_config.TextColumn(disabled=True),
-                "Dépôt": st.column_config.NumberColumn(min_value=0, step=1),
-            },
-            key="ed_box_deposit",
-        )
-        st.session_state.df_box_deposit = normalize_box_deposit_df(edited_deposit)
+        # ensure at least one denom allowed
+        if not allowed:
+            st.warning("Choisis au moins un type autorisé (sinon impossible de faire du change).")
+        st.session_state.boite_allowed = allowed
 
-    box_before = {r["Dénomination"]: safe_int(r["Boîte (avant)"]) for _, r in st.session_state.df_box_before.iterrows()}
+    # Main table: edit Boîte (avant) + Dépôt; computed columns disabled
+    edited_b = st.data_editor(
+        st.session_state.df_boite,
+        hide_index=True,
+        use_container_width=True,
+        height=520,
+        column_config={
+            "Dénomination": st.column_config.TextColumn(disabled=True),
+            "Boîte (avant)": st.column_config.NumberColumn(min_value=0, step=1),
+            "Dépôt": st.column_config.NumberColumn(min_value=0, step=1),
+            "Change retiré": st.column_config.NumberColumn(disabled=True),
+            "Boîte (après)": st.column_config.NumberColumn(disabled=True),
+        },
+        key="ed_boite",
+    )
+    # LIVE normalisation (no reindex wipe mid-edit)
+    st.session_state.df_boite = normalize_boite_df_live(edited_b)
 
-    # robust deposit extraction (handles any lingering legacy columns)
-    df_dep = st.session_state.df_box_deposit
-    if "Dépôt" not in df_dep.columns:
-        df_dep = normalize_box_deposit_df(df_dep)
-        st.session_state.df_box_deposit = df_dep
-    deposit = {r["Dénomination"]: safe_int(r["Dépôt"]) for _, r in df_dep.iterrows()}
+    dfb = st.session_state.df_boite
+    box_before = {r["Dénomination"]: safe_int(r["Boîte (avant)"]) for _, r in dfb.iterrows()}
+    deposit = {r["Dénomination"]: safe_int(r["Dépôt"]) for _, r in dfb.iterrows()}
 
     total_before = total_cents(box_before)
     total_deposit = total_cents(deposit)
@@ -636,11 +667,10 @@ with tab_boite:
     s2.success("Dépôt total: " + cents_to_str(total_deposit))
     s3.write("**Change à retirer (objectif):** " + f"**{cents_to_str(total_deposit)}**")
 
-    st.divider()
-    st.subheader("Change retiré proposé + ajustements ➖/➕")
-
+    # Suggest withdraw from boîte after deposit
     box_after_deposit = add_counts(box_before, deposit)
 
+    # Priority for boîte: small bills then coins, then rolls, big bills last
     priority_boite = (
         ["Billet 20 $", "Billet 10 $", "Billet 5 $"]
         + ["Pièce 2 $", "Pièce 1 $", "Pièce 0,25 $", "Pièce 0,10 $", "Pièce 0,05 $"]
@@ -649,20 +679,34 @@ with tab_boite:
     )
 
     withdraw = {k: 0 for k in DENOMS}
+    box_after = dict(box_after_deposit)
     remaining = 0
 
-    st.session_state.locked_withdraw_boite = clamp_locked(st.session_state.locked_withdraw_boite, box_after_deposit)
+    if total_deposit > 0 and st.session_state.boite_allowed:
+        st.session_state.locked_withdraw_boite = clamp_locked(st.session_state.locked_withdraw_boite, box_after_deposit)
+        withdraw, remaining = suggest_withdrawal(
+            total_deposit,
+            allowed=list(st.session_state.boite_allowed),
+            avail=box_after_deposit,
+            locked=dict(st.session_state.locked_withdraw_boite),
+            priority=priority_boite,
+        )
+        box_after = sub_counts(box_after_deposit, withdraw)
+
+    # Update computed columns in the table (no aggressive reindex)
+    df = st.session_state.df_boite.copy()
+    df["Change retiré"] = df["Dénomination"].map(lambda k: safe_int(withdraw.get(k, 0)))
+    df["Boîte (après)"] = df["Dénomination"].map(lambda k: safe_int(box_after.get(k, 0)))
+    st.session_state.df_boite = normalize_boite_df_live(df)
+
+    st.divider()
+    st.subheader("Ajuster le change retiré (➖/➕)")
 
     if total_deposit == 0:
         st.warning("Dépôt = 0. Rien à calculer.")
+    elif not st.session_state.boite_allowed:
+        st.error("Aucun type autorisé sélectionné.")
     else:
-        withdraw, remaining = suggest_withdrawal(
-            total_deposit,
-            box_after_deposit,
-            dict(st.session_state.locked_withdraw_boite),
-            priority_boite,
-        )
-
         if remaining == 0:
             st.success("Change retiré: " + cents_to_str(total_cents(withdraw)))
         elif remaining < 0:
@@ -670,57 +714,55 @@ with tab_boite:
         else:
             st.warning("Impossible exact. Reste: " + cents_to_str(remaining))
 
-    if st.button("Reset ajustements (boîte)", key="btn_reset_boite_locks"):
-        st.session_state.locked_withdraw_boite = {}
-        st.rerun()
+        if st.button("Reset ajustements (boîte)", key="btn_reset_boite_locks"):
+            st.session_state.locked_withdraw_boite = {}
+            st.rerun()
 
-    keys = DISPLAY_ORDER
-    for i in range(0, len(keys), 5):
-        row = st.columns(5)
-        for j, k in enumerate(keys[i : i + 5]):
-            with row[j]:
-                q = safe_int(withdraw.get(k, 0))
-                mx = safe_int(box_after_deposit.get(k, 0))
-                st.markdown(f"**{k}**")
-                mcol, pcol = st.columns(2)
-                minus = mcol.button("➖", key=f"b_minus_{k}")
-                plus = pcol.button("➕", key=f"b_plus_{k}")
-                st.caption(f"Retrait: {q} | Dispo: {mx}")
+        # +/- grid, only for allowed denominations (cleaner)
+        allowed_sorted = [k for k in DISPLAY_ORDER if k in st.session_state.boite_allowed]
+        if not allowed_sorted:
+            st.warning("Aucune dénomination autorisée.")
+        else:
+            for i in range(0, len(allowed_sorted), 5):
+                row = st.columns(5)
+                for j, k in enumerate(allowed_sorted[i:i+5]):
+                    with row[j]:
+                        q = safe_int(withdraw.get(k, 0))
+                        mx = safe_int(box_after_deposit.get(k, 0))
+                        st.markdown(f"**{k}**")
+                        mcol, pcol = st.columns(2)
+                        minus = mcol.button("➖", key=f"b_minus_{k}")
+                        plus = pcol.button("➕", key=f"b_plus_{k}")
+                        st.caption(f"Retrait: {q} | Dispo: {mx}")
 
-                if minus or plus:
-                    new_locked = dict(st.session_state.locked_withdraw_boite)
-                    if k not in new_locked:
-                        new_locked[k] = q
-                    if minus:
-                        new_locked[k] = max(0, safe_int(new_locked[k]) - 1)
-                    if plus:
-                        new_locked[k] = min(mx, safe_int(new_locked[k]) + 1)
-                    st.session_state.locked_withdraw_boite = new_locked
-                    st.rerun()
+                        if minus or plus:
+                            new_locked = dict(st.session_state.locked_withdraw_boite)
+                            if k not in new_locked:
+                                new_locked[k] = q
+                            if minus:
+                                new_locked[k] = max(0, safe_int(new_locked[k]) - 1)
+                            if plus:
+                                new_locked[k] = min(mx, safe_int(new_locked[k]) + 1)
+                            st.session_state.locked_withdraw_boite = new_locked
+                            st.rerun()
 
-    box_after = sub_counts(box_after_deposit, withdraw)
-    st.info("Boîte (après échange): " + cents_to_str(total_cents(box_after)))
-
+    # Receipt rows (same as table + TOTAL)
     rows_boite = []
     for k in DISPLAY_ORDER:
-        rows_boite.append(
-            {
-                "Dénomination": k,
-                "Boîte (avant)": safe_int(box_before.get(k, 0)),
-                "Dépôt": safe_int(deposit.get(k, 0)),
-                "Change retiré": safe_int(withdraw.get(k, 0)),
-                "Boîte (après)": safe_int(box_after.get(k, 0)),
-            }
-        )
-    rows_boite.append(
-        {
-            "Dénomination": "TOTAL ($)",
-            "Boîte (avant)": f"{total_before/100:.2f}",
-            "Dépôt": f"{total_deposit/100:.2f}",
-            "Change retiré": f"{total_cents(withdraw)/100:.2f}",
-            "Boîte (après)": f"{total_cents(box_after)/100:.2f}",
-        }
-    )
+        rows_boite.append({
+            "Dénomination": k,
+            "Boîte (avant)": safe_int(box_before.get(k, 0)),
+            "Dépôt": safe_int(deposit.get(k, 0)),
+            "Change retiré": safe_int(withdraw.get(k, 0)),
+            "Boîte (après)": safe_int(box_after.get(k, 0)),
+        })
+    rows_boite.append({
+        "Dénomination": "TOTAL ($)",
+        "Boîte (avant)": f"{total_before/100:.2f}",
+        "Dépôt": f"{total_deposit/100:.2f}",
+        "Change retiré": f"{total_cents(withdraw)/100:.2f}",
+        "Boîte (après)": f"{total_cents(box_after)/100:.2f}",
+    })
 
     meta_boite = {
         "Type": "BOÎTE (ÉCHANGE)",
@@ -734,9 +776,9 @@ with tab_boite:
     payload_boite = {
         "meta": meta_boite,
         "boite": {
-            "table_before": st.session_state.df_box_before.to_dict("records"),
-            "table_deposit": st.session_state.df_box_deposit.to_dict("records"),
+            "table": st.session_state.df_boite.to_dict("records"),
             "locked_withdraw": st.session_state.locked_withdraw_boite,
+            "allowed_denoms": sorted(list(st.session_state.boite_allowed)),
             "rows": rows_boite,
         },
     }
@@ -769,7 +811,7 @@ with tab_boite:
 # ================== TAB: SAUVEGARDE ==================
 with tab_save:
     st.subheader("Sauvegarde & reçus")
-    st.caption("Liste simple (date + titre). Clique pour ouvrir, imprimer, et télécharger. Caisse et Boîte sont séparés.")
+    st.caption("Liste simple (date + titre). Clique pour ouvrir. Téléchargements séparés Caisse vs Boîte.")
 
     colA, colB = st.columns(2)
 
@@ -791,7 +833,6 @@ with tab_save:
                     else:
                         st.warning("Reçu introuvable pour cette date.")
 
-                    # Unique keys => no StreamlitDuplicateElementId
                     if os.path.exists(rp):
                         with open(rp, "rb") as f:
                             st.download_button(
