@@ -1,12 +1,11 @@
-# registre_200_app.py
-# Caisse + Boîte de monnaie (Change Box)
-# - 2 onglets
-# - Caisse: retrait favorise 100/50/20, puis 10/5 rarement, pièces pour finir, rouleaux dernier
-# - Change box: transferts/retraits favorisent pièces + rouleaux + 10/5 (petit), gros billets en dernier
-# - Persistant par date: charge automatiquement l'état du jour, sauvegarde auto + export Excel quotidien
-# - Téléchargement du reçu (Excel) + état (JSON)
-# - Timezone Montréal (America/Toronto)
-# - Auth via st.secrets["APP_PASSWORD"] (avec fallback propre)
+# caisse200_plus.py
+# Registre quotidien — Caisse (retour cible) + Boîte de monnaie + Historique
+# Fixes:
+# - NO reset while typing: use st.form() for counting
+# - Printable "receipt" HTML + Print button
+# - 3rd tab "Historique" to reopen any day
+# - Plus/minus buttons for quick adjustments
+# - Autosave per day (JSON + HTML receipt). Excel optional if openpyxl installed.
 
 import os
 import json
@@ -14,27 +13,38 @@ import hashlib
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
 
-import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
-# ================== CONFIG APP ==================
-st.set_page_config(page_title="Caisse & Boîte de monnaie — Registre quotidien", layout="wide")
 TZ = ZoneInfo("America/Toronto")
 
+# ------------------ PATHS ------------------
 DATA_DIR = "data"
 RECORDS_DIR = os.path.join(DATA_DIR, "records")
 os.makedirs(RECORDS_DIR, exist_ok=True)
 
-# ================== AUTH ==================
+def day_key(d: date) -> str:
+    return d.isoformat()
+
+def state_path(d: date) -> str:
+    return os.path.join(RECORDS_DIR, f"{day_key(d)}_state.json")
+
+def receipt_path(d: date) -> str:
+    return os.path.join(RECORDS_DIR, f"{day_key(d)}_receipt.html")
+
+# ------------------ CONFIG ------------------
+st.set_page_config(page_title="Caisse & Boîte — Registre", layout="wide")
+
+# ------------------ AUTH ------------------
 if "auth" not in st.session_state:
     st.session_state.auth = False
 
 if not st.session_state.auth:
     st.title("Accès protégé")
     pwd = st.text_input("Mot de passe", type="password")
-    app_password = st.secrets.get("APP_PASSWORD", None)
+    app_password = st.secrets.get("APP_PASSWORD")
     if st.button("Se connecter"):
-        if app_password is None:
+        if not app_password:
             st.error("APP_PASSWORD manquant dans Streamlit secrets.")
             st.stop()
         if pwd == app_password:
@@ -44,21 +54,18 @@ if not st.session_state.auth:
             st.error("Mot de passe incorrect.")
     st.stop()
 
-# ================== DENOMS ==================
+# ------------------ DENOMS ------------------
 DENOMS = {
-    # Billets
     "Billet 100 $": 10000,
     "Billet 50 $": 5000,
     "Billet 20 $": 2000,
     "Billet 10 $": 1000,
     "Billet 5 $": 500,
-    # Pièces
     "Pièce 2 $": 200,
     "Pièce 1 $": 100,
     "Pièce 0,25 $": 25,
     "Pièce 0,10 $": 10,
     "Pièce 0,05 $": 5,
-    # Rouleaux
     "Rouleau 2 $ (25) — 50 $": 5000,
     "Rouleau 1 $ (25) — 25 $": 2500,
     "Rouleau 0,25 $ (40) — 10 $": 1000,
@@ -76,12 +83,11 @@ ROLLS = [
     "Rouleau 0,10 $ (50) — 5 $",
     "Rouleau 0,05 $ (40) — 2 $",
 ]
-
 DISPLAY_ORDER = BILLS_BIG + BILLS_SMALL + COINS + ROLLS
 
-# ================== HELPERS ==================
+# ------------------ HELPERS ------------------
 def cents_to_str(c: int) -> str:
-    return f"{c / 100:.2f} $"
+    return f"{c/100:.2f} $"
 
 def total_cents(counts: dict) -> int:
     return sum(int(counts.get(k, 0)) * DENOMS[k] for k in DENOMS)
@@ -91,15 +97,6 @@ def sub_counts(a: dict, b: dict) -> dict:
 
 def add_counts(a: dict, b: dict) -> dict:
     return {k: int(a.get(k, 0)) + int(b.get(k, 0)) for k in DENOMS}
-
-def clamp_counts(counts: dict) -> dict:
-    out = {}
-    for k in DENOMS:
-        v = int(counts.get(k, 0))
-        if v < 0:
-            v = 0
-        out[k] = v
-    return out
 
 def clamp_locked(locked: dict, avail: dict) -> dict:
     out = {}
@@ -129,14 +126,7 @@ def take_greedy(remaining: int, keys: list, avail: dict, out: dict, locked: dict
             remaining -= int(take) * v
     return remaining
 
-def suggest_by_priority(amount_cents: int, allowed: list, avail: dict, locked: dict, priority_keys: list):
-    """
-    Greedy par priorité explicitement donnée.
-    - amount_cents: montant à couvrir
-    - allowed: types autorisés
-    - avail: dispo
-    - locked: quantités verrouillées (déjà imposées)
-    """
+def suggest(amount_cents: int, allowed: list, avail: dict, locked: dict, priority: list):
     out = {k: 0 for k in DENOMS}
     for k, q in locked.items():
         out[k] = int(q)
@@ -146,91 +136,190 @@ def suggest_by_priority(amount_cents: int, allowed: list, avail: dict, locked: d
         return out, remaining
 
     allowed_set = set(allowed)
-    keys = [k for k in priority_keys if k in allowed_set]
-
+    keys = [k for k in priority if k in allowed_set]
     remaining = take_greedy(remaining, keys, avail, out, locked)
     return out, remaining
 
 def suggest_retrait_caisse(diff_cents: int, allowed: list, avail: dict, locked: dict):
-    # Caisse: gros billets d'abord, puis petits billets rarement, pièces pour finir, rouleaux dernier
-    coins_desc = sorted([k for k in COINS], key=lambda x: DENOMS[x], reverse=True)
-    rolls_desc = sorted([k for k in ROLLS], key=lambda x: DENOMS[x], reverse=True)
+    coins_desc = sorted(COINS, key=lambda x: DENOMS[x], reverse=True)
+    rolls_desc = sorted(ROLLS, key=lambda x: DENOMS[x], reverse=True)
     priority = BILLS_BIG + BILLS_SMALL + coins_desc + rolls_desc
-    return suggest_by_priority(diff_cents, allowed, avail, locked, priority)
+    return suggest(diff_cents, allowed, avail, locked, priority)
 
 def suggest_changebox(amount_cents: int, allowed: list, avail: dict, locked: dict):
-    # Boîte monnaie: favoriser pièces + rouleaux + petits billets, gros billets en dernier
-    coins_desc = sorted([k for k in COINS], key=lambda x: DENOMS[x], reverse=True)
-    rolls_desc = sorted([k for k in ROLLS], key=lambda x: DENOMS[x], reverse=True)
+    coins_desc = sorted(COINS, key=lambda x: DENOMS[x], reverse=True)
+    rolls_desc = sorted(ROLLS, key=lambda x: DENOMS[x], reverse=True)
     priority = coins_desc + rolls_desc + BILLS_SMALL + BILLS_BIG
-    return suggest_by_priority(amount_cents, allowed, avail, locked, priority)
+    return suggest(amount_cents, allowed, avail, locked, priority)
 
-def dict_from_df(df: pd.DataFrame, col_qty: str) -> dict:
-    return {row["Dénomination"]: int(row[col_qty]) for _, row in df.iterrows()}
-
-def default_register_df():
-    return pd.DataFrame([{"Dénomination": k, "OPEN": 0, "CLOSE": 0, "Autorisé retrait": True} for k in DISPLAY_ORDER])
-
-def default_changebox_df():
-    return pd.DataFrame([{"Dénomination": k, "Boîte (actuel)": 0, "Autorisé boîte": True} for k in DISPLAY_ORDER])
-
-def safe_date_str(d: date) -> str:
-    return d.isoformat()
-
-def state_path_for(d: date) -> str:
-    return os.path.join(RECORDS_DIR, f"{safe_date_str(d)}_state.json")
-
-def excel_path_for(d: date) -> str:
-    return os.path.join(RECORDS_DIR, f"{safe_date_str(d)}_registre.xlsx")
-
-def hash_state(obj: dict) -> str:
+def hash_payload(obj: dict) -> str:
     raw = json.dumps(obj, sort_keys=True, ensure_ascii=False).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
 
-def load_state_for(d: date):
-    p = state_path_for(d)
+# ------------------ STORAGE ------------------
+def load_day(d: date):
+    p = state_path(d)
     if not os.path.exists(p):
         return None
     with open(p, "r", encoding="utf-8") as f:
         return json.load(f)
 
-def save_state_for(d: date, payload: dict):
-    p = state_path_for(d)
-    with open(p, "w", encoding="utf-8") as f:
+def save_day(d: date, payload: dict):
+    with open(state_path(d), "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
-def export_excel_for(d: date, payload: dict):
-    """
-    Écrit un fichier Excel journalier avec:
-    - Meta
-    - Caisse (inputs + calcul)
-    - Boîte de monnaie (inputs + calcul)
-    """
-    xlsx = excel_path_for(d)
-
+def build_receipt_html(payload: dict) -> str:
     meta = payload.get("meta", {})
     reg = payload.get("register", {})
     box = payload.get("changebox", {})
 
-    meta_rows = [{"Champ": k, "Valeur": str(v)} for k, v in meta.items()]
-    df_meta = pd.DataFrame(meta_rows)
+    def table_html(title, headers, rows):
+        thead = "".join([f"<th>{h}</th>" for h in headers])
+        body = ""
+        for r in rows:
+            body += "<tr>" + "".join([f"<td>{r.get(h,'')}</td>" for h in headers]) + "</tr>"
+        return f"""
+        <div class="section">
+          <h3>{title}</h3>
+          <table>
+            <thead><tr>{thead}</tr></thead>
+            <tbody>{body}</tbody>
+          </table>
+        </div>
+        """
 
-    df_reg_inputs = pd.DataFrame(reg.get("table", []))
-    df_reg_calc = pd.DataFrame(reg.get("calc_rows", []))
+    meta_lines = "".join([f"<div class='meta-row'><b>{k}:</b> {v}</div>" for k, v in meta.items()])
 
-    df_box_inputs = pd.DataFrame(box.get("table", []))
-    df_box_calc = pd.DataFrame(box.get("calc_rows", []))
+    reg_rows = reg.get("rows_calc", [])
+    box_rows = box.get("rows_calc", [])
 
-    with pd.ExcelWriter(xlsx, engine="openpyxl") as writer:
-        df_meta.to_excel(writer, sheet_name="Meta", index=False)
-        df_reg_inputs.to_excel(writer, sheet_name="Caisse_Inputs", index=False)
-        df_reg_calc.to_excel(writer, sheet_name="Caisse_Calcul", index=False)
-        df_box_inputs.to_excel(writer, sheet_name="Boite_Inputs", index=False)
-        df_box_calc.to_excel(writer, sheet_name="Boite_Calcul", index=False)
+    html = f"""
+    <html>
+    <head>
+      <meta charset="utf-8" />
+      <title>Reçu — Registre</title>
+      <style>
+        body {{ font-family: Arial, sans-serif; padding: 18px; color:#111; }}
+        .top {{ display:flex; justify-content:space-between; align-items:flex-start; gap:16px; }}
+        .meta {{ font-size: 13px; opacity: 0.9; }}
+        .section {{ margin-top: 18px; }}
+        h2 {{ margin:0; }}
+        h3 {{ margin: 0 0 8px 0; }}
+        table {{ width:100%; border-collapse: collapse; font-size: 13px; }}
+        th, td {{ border: 1px solid #222; padding: 6px; }}
+        th {{ background: #f0f0f0; }}
+        .btnbar {{ margin-top: 12px; display:flex; gap:10px; }}
+        button {{ padding:10px 14px; border-radius:10px; border:1px solid #bbb; background:#fff; cursor:pointer; font-weight:600; }}
+        .note {{ font-size:12px; opacity:0.7; margin-top:6px; }}
+      </style>
+    </head>
+    <body>
+      <div class="top">
+        <div>
+          <h2>Registre — Caisse & Boîte de monnaie</h2>
+          <div class="note">Impression: utilise le bouton ci-dessous.</div>
+        </div>
+        <div class="meta">{meta_lines}</div>
+      </div>
 
-    return xlsx
+      <div class="btnbar">
+        <button onclick="window.print()">🖨️ Imprimer</button>
+      </div>
 
-def rows_calc_table(open_c, close_c, retrait_c, restant_c):
+      {table_html("Caisse — Calcul", ["Dénomination","OPEN","CLOSE","RETRAIT","RESTANT"], reg_rows)}
+      {table_html("Boîte de monnaie — Calcul", ["Dénomination","Boîte (actuel)","Vers boîte","Depuis boîte","Boîte (après)"], box_rows)}
+    </body>
+    </html>
+    """
+    return html
+
+def save_receipt_file(d: date, payload: dict):
+    html = build_receipt_html(payload)
+    with open(receipt_path(d), "w", encoding="utf-8") as f:
+        f.write(html)
+
+# ------------------ STATE BOOT ------------------
+today = datetime.now(TZ).date()
+
+if "active_date" not in st.session_state:
+    st.session_state.active_date = today
+
+if "booted_for" not in st.session_state or st.session_state.booted_for != today:
+    st.session_state.booted_for = today
+    st.session_state.active_date = today
+
+    existing = load_day(today)
+
+    # meta
+    st.session_state.cashier = (existing or {}).get("meta", {}).get("Caissier(ère)", "")
+    st.session_state.register_no = int((existing or {}).get("meta", {}).get("Caisse #", 1))
+    st.session_state.target_dollars = int((existing or {}).get("meta", {}).get("Cible $", 200))
+    st.session_state.box_target_dollars = int((existing or {}).get("changebox", {}).get("box_target_dollars", 0))
+
+    # counts
+    st.session_state.open_counts = (existing or {}).get("register", {}).get("open_counts", {k: 0 for k in DENOMS})
+    st.session_state.close_counts = (existing or {}).get("register", {}).get("close_counts", {k: 0 for k in DENOMS})
+    st.session_state.allowed_retrait = (existing or {}).get("register", {}).get("allowed_retrait", list(DISPLAY_ORDER))
+
+    st.session_state.box_now = (existing or {}).get("changebox", {}).get("box_now", {k: 0 for k in DENOMS})
+    st.session_state.allowed_box = (existing or {}).get("changebox", {}).get("allowed_box", list(DISPLAY_ORDER))
+
+    # locks
+    st.session_state.locked_retrait = (existing or {}).get("register", {}).get("locked_retrait", {})
+    st.session_state.locked_to_box = (existing or {}).get("changebox", {}).get("locked_to_box", {})
+    st.session_state.locked_from_box = (existing or {}).get("changebox", {}).get("locked_from_box", {})
+
+    st.session_state.last_saved_hash = None
+    st.session_state.last_saved_at = None
+
+# ------------------ UI HEADER ------------------
+st.title("Registre quotidien — Caisse & Boîte de monnaie")
+top = st.columns([1.2, 1.2, 1.5, 1.8, 2.3])
+
+with top[0]:
+    st.write("**Date:**", today.isoformat())
+with top[1]:
+    st.write("**Heure:**", datetime.now(TZ).strftime("%H:%M"))
+with top[2]:
+    st.session_state.register_no = st.selectbox("Caisse #", [1, 2, 3], index=[1,2,3].index(st.session_state.register_no))
+with top[3]:
+    st.session_state.cashier = st.text_input("Caissier(ère)", value=st.session_state.cashier)
+with top[4]:
+    st.session_state.target_dollars = st.number_input("Cible à laisser ($)", min_value=0, step=10, value=int(st.session_state.target_dollars))
+
+st.divider()
+
+# ------------------ INPUT GRID W/ +/- ------------------
+def denom_grid(title: str, prefix: str, counts: dict):
+    st.subheader(title)
+    st.caption("Astuce: utilise ➖/➕ pour ajuster vite. Rien ne se reset pendant que tu tapes (form).")
+
+    # 4 columns grid
+    cols_per_row = 4
+    keys = DISPLAY_ORDER
+
+    for i in range(0, len(keys), cols_per_row):
+        row_cols = st.columns(cols_per_row)
+        for j, k in enumerate(keys[i:i+cols_per_row]):
+            with row_cols[j]:
+                st.markdown(f"**{k}**")
+                m, p = st.columns([1,1])
+                if m.button("➖", key=f"{prefix}_minus_{k}"):
+                    counts[k] = max(0, int(counts.get(k, 0)) - 1)
+                if p.button("➕", key=f"{prefix}_plus_{k}"):
+                    counts[k] = int(counts.get(k, 0)) + 1
+
+                counts[k] = st.number_input(
+                    "Qté",
+                    min_value=0,
+                    step=1,
+                    value=int(counts.get(k, 0)),
+                    key=f"{prefix}_qty_{k}",
+                    label_visibility="collapsed",
+                )
+
+# ------------------ CALC ROWS ------------------
+def rows_caisse(open_c, close_c, retrait_c, restant_c):
     rows = []
     for k in DISPLAY_ORDER:
         rows.append({
@@ -249,7 +338,7 @@ def rows_calc_table(open_c, close_c, retrait_c, restant_c):
     })
     return rows
 
-def rows_box_calc_table(box_now, to_box, from_box, box_after):
+def rows_box(box_now, to_box, from_box, box_after):
     rows = []
     for k in DISPLAY_ORDER:
         rows.append({
@@ -268,447 +357,290 @@ def rows_box_calc_table(box_now, to_box, from_box, box_after):
     })
     return rows
 
-# ================== DAILY STATE BOOT ==================
-today = datetime.now(TZ).date()
+# ------------------ TABS ------------------
+tab1, tab2, tab3 = st.tabs(["1) Caisse", "2) Boîte de monnaie", "3) Historique / Reçus"])
 
-if "active_date" not in st.session_state:
-    st.session_state.active_date = today
-
-# If day changed (or first run), load today's state if exists, else init fresh
-if "booted" not in st.session_state or st.session_state.active_date != today:
-    st.session_state.active_date = today
-    st.session_state.booted = True
-
-    existing = load_state_for(today)
-    if existing:
-        st.session_state.meta_cashier = existing.get("meta", {}).get("Caissier(ère)", "")
-        st.session_state.meta_register_no = int(existing.get("meta", {}).get("Caisse #", 1))
-        st.session_state.meta_target = int(existing.get("meta", {}).get("Cible $", 200))
-
-        st.session_state.df_register = pd.DataFrame(existing.get("register", {}).get("table", default_register_df().to_dict("records")))
-        st.session_state.df_changebox = pd.DataFrame(existing.get("changebox", {}).get("table", default_changebox_df().to_dict("records")))
-
-        st.session_state.locked_retrait = existing.get("register", {}).get("locked_retrait", {})
-        st.session_state.locked_to_box = existing.get("changebox", {}).get("locked_to_box", {})
-        st.session_state.locked_from_box = existing.get("changebox", {}).get("locked_from_box", {})
-        st.session_state.box_target = int(existing.get("changebox", {}).get("box_target", 0))
-    else:
-        st.session_state.meta_cashier = ""
-        st.session_state.meta_register_no = 1
-        st.session_state.meta_target = 200
-
-        st.session_state.df_register = default_register_df()
-        st.session_state.df_changebox = default_changebox_df()
-
-        st.session_state.locked_retrait = {}
-        st.session_state.locked_to_box = {}
-        st.session_state.locked_from_box = {}
-        st.session_state.box_target = 0
-
-    st.session_state.last_saved_hash = None
-    st.session_state.last_saved_at = None
-
-# ================== TOP BAR ==================
-st.title("Registre quotidien — Caisse & Boîte de monnaie")
-st.caption("Ça sauvegarde par date. Ça garde les données. Comme un vrai système. Incroyable.")
-
-top1, top2, top3, top4, top5 = st.columns([1.1, 1.1, 1.2, 1.2, 2.2])
-with top1:
-    st.write("**Date:**", st.session_state.active_date.isoformat())
-with top2:
-    now_time = datetime.now(TZ).strftime("%H:%M")
-    st.write("**Heure:**", now_time)
-with top3:
-    st.session_state.meta_register_no = st.selectbox("Caisse #", [1, 2, 3], index=[1,2,3].index(st.session_state.meta_register_no))
-with top4:
-    st.session_state.meta_cashier = st.text_input("Caissier(ère)", value=st.session_state.meta_cashier)
-with top5:
-    st.session_state.meta_target = st.number_input("Cible à laisser ($)", min_value=0, step=10, value=int(st.session_state.meta_target))
-
-st.divider()
-
-# ================== AUTOSAVE (smart) ==================
-def build_payload_for_save(reg_calc_rows, box_calc_rows, extra_meta):
-    payload = {
-        "meta": extra_meta,
-        "register": {
-            "table": st.session_state.df_register.to_dict("records"),
-            "locked_retrait": st.session_state.locked_retrait,
-            "calc_rows": reg_calc_rows,
-        },
-        "changebox": {
-            "table": st.session_state.df_changebox.to_dict("records"),
-            "box_target": int(st.session_state.box_target),
-            "locked_to_box": st.session_state.locked_to_box,
-            "locked_from_box": st.session_state.locked_from_box,
-            "calc_rows": box_calc_rows,
-        },
-    }
-    return payload
-
-def autosave_if_needed(payload: dict):
-    h = hash_state(payload)
-    if st.session_state.last_saved_hash == h:
-        return
-    save_state_for(today, payload)
-    export_excel_for(today, payload)
-    st.session_state.last_saved_hash = h
-    st.session_state.last_saved_at = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
-
-# ================== TABS ==================
-tab1, tab2 = st.tabs(["1) Caisse (retour à la cible)", "2) Boîte de monnaie (change box)"])
-
-# ================== TAB 1: CAISSE ==================
+# ========================= TAB 1 =========================
 with tab1:
-    st.subheader("Caisse — OPEN/CLOSE + Autorisés")
-    st.caption("Tout en tableau pour réduire le scroll.")
+    with st.form("form_caisse", clear_on_submit=False):
+        denom_grid("OPEN — Fond de caisse", "open", st.session_state.open_counts)
+        st.info("TOTAL OPEN: " + cents_to_str(total_cents(st.session_state.open_counts)))
 
-    edited_reg = st.data_editor(
-        st.session_state.df_register,
-        hide_index=True,
-        use_container_width=True,
-        column_config={
-            "Dénomination": st.column_config.TextColumn(disabled=True),
-            "OPEN": st.column_config.NumberColumn(min_value=0, step=1),
-            "CLOSE": st.column_config.NumberColumn(min_value=0, step=1),
-            "Autorisé retrait": st.column_config.CheckboxColumn(),
-        },
-        height=520
-    )
-    st.session_state.df_register = edited_reg
+        st.divider()
 
-    open_counts = dict_from_df(edited_reg, "OPEN")
-    close_counts = dict_from_df(edited_reg, "CLOSE")
-    allowed_retrait = [r["Dénomination"] for _, r in edited_reg.iterrows() if bool(r["Autorisé retrait"])]
+        denom_grid("CLOSE — Comptage fin de journée", "close", st.session_state.close_counts)
+        st.success("TOTAL CLOSE: " + cents_to_str(total_cents(st.session_state.close_counts)))
 
-    TARGET = int(st.session_state.meta_target) * 100
-    total_close = total_cents(close_counts)
-    total_open = total_cents(open_counts)
+        st.divider()
 
-    a, b, c = st.columns(3)
-    a.info("TOTAL OPEN : " + cents_to_str(total_open))
-    b.success("TOTAL CLOSE : " + cents_to_str(total_close))
+        st.subheader("Types autorisés (retrait)")
+        a1, a2, a3 = st.columns(3)
+        allowed = []
+        for idx, k in enumerate(DISPLAY_ORDER):
+            col = [a1, a2, a3][idx % 3]
+            with col:
+                if st.checkbox(k, value=(k in st.session_state.allowed_retrait), key=f"allow_retrait_{k}"):
+                    allowed.append(k)
+
+        submitted = st.form_submit_button("✅ Enregistrer / Calculer (Caisse)")
+
+        if submitted:
+            st.session_state.allowed_retrait = allowed
+
+    # Compute retrait after form submit (or from current state)
+    TARGET = int(st.session_state.target_dollars) * 100
+    total_close = total_cents(st.session_state.close_counts)
     diff = total_close - TARGET
-    c.write("**À retirer (CLOSE - cible):** " + f"**{cents_to_str(diff)}**")
 
     st.divider()
-    st.subheader("Proposition de retrait + Ajustements")
+    st.subheader("RETRAIT — Proposition + ajustements")
 
-    ctrl1, ctrl2, ctrl3, ctrl4 = st.columns([1.3, 1.3, 1.6, 2.8])
-    with ctrl1:
-        if st.button("Proposer retrait (reset ajustements)"):
-            st.session_state.locked_retrait = {}
-            st.rerun()
-    with ctrl2:
-        if st.button("Réinitialiser ajustements"):
-            st.session_state.locked_retrait = {}
-            st.rerun()
-    with ctrl3:
-        st.write("Verrouillés:", len(st.session_state.locked_retrait))
-    with ctrl4:
-        st.caption("➖/➕ verrouille une dénomination, le reste se recalcule.")
+    st.write("Cible:", f"**{cents_to_str(TARGET)}**")
+    st.write("À retirer (CLOSE - cible):", f"**{cents_to_str(diff)}**")
 
     retrait_counts = {k: 0 for k in DENOMS}
-    restant_counts = dict(close_counts)
+    restant_counts = dict(st.session_state.close_counts)
     remaining = 0
 
     if diff <= 0:
-        st.warning("Caisse sous la cible (ou égale). Ici il faudrait AJOUTER, pas retirer.")
-    elif not allowed_retrait:
+        st.warning("Sous la cible (ou égal). Ici il faudrait AJOUTER, pas retirer.")
+    elif not st.session_state.allowed_retrait:
         st.error("Choisis au moins un type autorisé.")
     else:
-        st.session_state.locked_retrait = clamp_locked(st.session_state.locked_retrait, close_counts)
+        st.session_state.locked_retrait = clamp_locked(st.session_state.locked_retrait, st.session_state.close_counts)
         locked = dict(st.session_state.locked_retrait)
 
-        retrait_counts, remaining = suggest_retrait_caisse(diff, allowed_retrait, close_counts, locked)
-        retrait_total = total_cents(retrait_counts)
+        retrait_counts, remaining = suggest_retrait_caisse(diff, st.session_state.allowed_retrait, st.session_state.close_counts, locked)
 
         if remaining == 0:
-            st.success("RETRAIT proposé: " + cents_to_str(retrait_total))
+            st.success("Retrait proposé: " + cents_to_str(total_cents(retrait_counts)))
         elif remaining < 0:
-            st.warning("Tu as dépassé de " + cents_to_str(-remaining) + " (verrouillage trop haut).")
+            st.warning("Retrait dépasse de " + cents_to_str(-remaining) + " (verrouillage trop haut).")
         else:
-            st.warning("Impossible exact. Reste non couvert: " + cents_to_str(remaining))
+            st.warning("Impossible exact. Reste: " + cents_to_str(remaining))
 
-        # Horizontal grid for +/- adjustments
-        adjust_keys = [k for k in DISPLAY_ORDER if k in allowed_retrait]
+        # Adjustment grid
+        adjust_keys = [k for k in DISPLAY_ORDER if k in st.session_state.allowed_retrait]
         cols_per_row = 4
 
         for i in range(0, len(adjust_keys), cols_per_row):
             row_cols = st.columns(cols_per_row)
-            for j, k in enumerate(adjust_keys[i:i + cols_per_row]):
+            for j, k in enumerate(adjust_keys[i:i+cols_per_row]):
                 with row_cols[j]:
                     q = int(retrait_counts.get(k, 0))
-                    max_avail = int(close_counts.get(k, 0))
+                    mx = int(st.session_state.close_counts.get(k, 0))
 
                     st.markdown(f"**{k}**")
-                    mcol, pcol = st.columns(2)
-                    minus = mcol.button("➖", key=f"r_minus_{k}")
-                    plus = pcol.button("➕", key=f"r_plus_{k}")
-
+                    m, p = st.columns(2)
+                    minus = m.button("➖", key=f"r_minus_{k}")
+                    plus = p.button("➕", key=f"r_plus_{k}")
                     st.write(f"Retrait: **{q}**")
-                    st.caption(f"Dispo: {max_avail}")
+                    st.caption(f"Dispo: {mx}")
 
                     if minus or plus:
                         new_locked = dict(st.session_state.locked_retrait)
                         if k not in new_locked:
                             new_locked[k] = q
                         if minus:
-                            new_locked[k] = int(new_locked[k]) - 1
+                            new_locked[k] = max(0, int(new_locked[k]) - 1)
                         if plus:
-                            new_locked[k] = int(new_locked[k]) + 1
-                        if new_locked[k] < 0:
-                            new_locked[k] = 0
-                        if new_locked[k] > max_avail:
-                            new_locked[k] = max_avail
+                            new_locked[k] = min(mx, int(new_locked[k]) + 1)
                         st.session_state.locked_retrait = new_locked
                         st.rerun()
 
-        restant_counts = sub_counts(close_counts, retrait_counts)
-        st.divider()
-        st.info("RESTANT total (après retrait): " + cents_to_str(total_cents(restant_counts)))
+        restant_counts = sub_counts(st.session_state.close_counts, retrait_counts)
+        st.info("RESTANT (après retrait): " + cents_to_str(total_cents(restant_counts)))
 
-    reg_calc_rows = rows_calc_table(open_counts, close_counts, retrait_counts, restant_counts)
+    # Save restant_counts for tab2 linkage
+    st.session_state._register_restant_counts = restant_counts
+    st.session_state._register_retrait_counts = retrait_counts
 
-# ================== TAB 2: CHANGE BOX ==================
+# ========================= TAB 2 =========================
 with tab2:
-    st.subheader("Boîte de monnaie — état actuel")
-    st.caption("Ici on gère la boîte de change. Priorité: petites dénominations (pièces/rouleaux/10/5).")
-
-    edited_box = st.data_editor(
-        st.session_state.df_changebox,
-        hide_index=True,
-        use_container_width=True,
-        column_config={
-            "Dénomination": st.column_config.TextColumn(disabled=True),
-            "Boîte (actuel)": st.column_config.NumberColumn(min_value=0, step=1),
-            "Autorisé boîte": st.column_config.CheckboxColumn(),
-        },
-        height=520
-    )
-    st.session_state.df_changebox = edited_box
-
-    box_now = dict_from_df(edited_box, "Boîte (actuel)")
-    allowed_box = [r["Dénomination"] for _, r in edited_box.iterrows() if bool(r["Autorisé boîte"])]
-
-    st.session_state.box_target = st.number_input(
-        "Montant cible dans la boîte ($) (optionnel)",
+    st.session_state.box_target_dollars = st.number_input(
+        "Cible boîte ($) (optionnel)",
         min_value=0,
         step=10,
-        value=int(st.session_state.box_target),
-        help="Si tu mets un cible, l'app peut suggérer quoi ajouter/retirer pour s'en approcher."
+        value=int(st.session_state.box_target_dollars),
     )
-    box_target_cents = int(st.session_state.box_target) * 100
-    box_total = total_cents(box_now)
 
-    s1, s2, s3 = st.columns(3)
-    s1.info("TOTAL boîte (actuel): " + cents_to_str(box_total))
-    s2.write("**Cible boîte:** " + cents_to_str(box_target_cents))
-    delta_box = box_target_cents - box_total
-    s3.write("**Écart (cible - actuel):** " + cents_to_str(delta_box))
+    with st.form("form_box", clear_on_submit=False):
+        denom_grid("Boîte — état actuel", "box", st.session_state.box_now)
+        st.info("TOTAL boîte (actuel): " + cents_to_str(total_cents(st.session_state.box_now)))
+
+        st.divider()
+        st.subheader("Types autorisés (boîte)")
+        b1, b2, b3 = st.columns(3)
+        allowed_box = []
+        for idx, k in enumerate(DISPLAY_ORDER):
+            col = [b1, b2, b3][idx % 3]
+            with col:
+                if st.checkbox(k, value=(k in st.session_state.allowed_box), key=f"allow_box_{k}"):
+                    allowed_box.append(k)
+
+        submitted_box = st.form_submit_button("✅ Enregistrer / Calculer (Boîte)")
+
+        if submitted_box:
+            st.session_state.allowed_box = allowed_box
 
     st.divider()
-    st.subheader("Connexion avec la caisse")
-    st.caption("Source principale: le RESTANT de la caisse (après retrait) depuis l’onglet 1.")
+    st.subheader("Mouvements boîte (connecté à la caisse)")
 
-    # We use restant_counts from tab1 calculations (already computed in this run)
-    register_available_for_box = restant_counts  # what's left in register after retrait
-    st.write("Dispo côté caisse (après retrait): **" + cents_to_str(total_cents(register_available_for_box)) + "**")
+    register_avail = st.session_state.get("_register_restant_counts", {k: 0 for k in DENOMS})
+    st.write("Dispo depuis la caisse (RESTANT): **" + cents_to_str(total_cents(register_avail)) + "**")
 
-    # Determine actions:
-    # If box below target: need to transfer TO box from register
-    # If box above target: need to remove FROM box (take out)
+    box_target = int(st.session_state.box_target_dollars) * 100
+    box_total = total_cents(st.session_state.box_now)
+    delta = box_target - box_total  # + => need add to box, - => remove from box
+
     to_box = {k: 0 for k in DENOMS}
     from_box = {k: 0 for k in DENOMS}
-    rem_to = 0
-    rem_from = 0
 
-    cA, cB, cC = st.columns([1.6, 1.6, 3.0])
-    with cA:
-        if st.button("Proposer transferts (reset ajustements boîte)"):
-            st.session_state.locked_to_box = {}
-            st.session_state.locked_from_box = {}
-            st.rerun()
-    with cB:
-        if st.button("Réinitialiser ajustements boîte"):
-            st.session_state.locked_to_box = {}
-            st.session_state.locked_from_box = {}
-            st.rerun()
-    with cC:
-        st.caption("➖/➕ ici verrouille une dénomination pour le mouvement de boîte.")
-
-    # Compute suggestions based on delta
-    if not allowed_box:
+    if not st.session_state.allowed_box:
         st.error("Choisis au moins un type autorisé pour la boîte.")
     else:
-        if delta_box > 0:
-            # Need to ADD to box from register
-            amount = delta_box
-            st.write("**Action:** Ajouter à la boîte depuis la caisse: " + cents_to_str(amount))
+        if delta > 0:
+            st.write("**Action:** Ajouter à la boîte depuis la caisse:", f"**{cents_to_str(delta)}**")
+            st.session_state.locked_to_box = clamp_locked(st.session_state.locked_to_box, register_avail)
+            to_box, rem = suggest_changebox(delta, st.session_state.allowed_box, register_avail, dict(st.session_state.locked_to_box))
 
-            st.session_state.locked_to_box = clamp_locked(st.session_state.locked_to_box, register_available_for_box)
-            locked = dict(st.session_state.locked_to_box)
-
-            to_box, rem_to = suggest_changebox(amount, allowed_box, register_available_for_box, locked)
-
-            moved = total_cents(to_box)
-            if rem_to == 0:
-                st.success("À transférer vers boîte: " + cents_to_str(moved))
-            elif rem_to < 0:
-                st.warning("Transfert dépasse de " + cents_to_str(-rem_to) + " (verrouillage trop haut).")
+            if rem == 0:
+                st.success("Vers boîte: " + cents_to_str(total_cents(to_box)))
             else:
-                st.warning("Impossible exact. Reste: " + cents_to_str(rem_to))
+                st.warning("Reste non couvert: " + cents_to_str(rem))
 
-            # Adjustment grid (to_box)
-            st.markdown("### Ajuster le **transfert vers la boîte**")
-            adjust_keys = [k for k in DISPLAY_ORDER if k in allowed_box]
-            cols_per_row = 4
-            for i in range(0, len(adjust_keys), cols_per_row):
-                row_cols = st.columns(cols_per_row)
-                for j, k in enumerate(adjust_keys[i:i + cols_per_row]):
-                    with row_cols[j]:
-                        q = int(to_box.get(k, 0))
-                        max_avail = int(register_available_for_box.get(k, 0))
+        elif delta < 0:
+            need = -delta
+            st.write("**Action:** Retirer depuis la boîte:", f"**{cents_to_str(need)}**")
+            st.session_state.locked_from_box = clamp_locked(st.session_state.locked_from_box, st.session_state.box_now)
+            from_box, rem = suggest_changebox(need, st.session_state.allowed_box, st.session_state.box_now, dict(st.session_state.locked_from_box))
 
-                        st.markdown(f"**{k}**")
-                        mcol, pcol = st.columns(2)
-                        minus = mcol.button("➖", key=f"tb_minus_{k}")
-                        plus = pcol.button("➕", key=f"tb_plus_{k}")
-
-                        st.write(f"Vers boîte: **{q}**")
-                        st.caption(f"Dispo caisse: {max_avail}")
-
-                        if minus or plus:
-                            new_locked = dict(st.session_state.locked_to_box)
-                            if k not in new_locked:
-                                new_locked[k] = q
-                            if minus:
-                                new_locked[k] = int(new_locked[k]) - 1
-                            if plus:
-                                new_locked[k] = int(new_locked[k]) + 1
-                            if new_locked[k] < 0:
-                                new_locked[k] = 0
-                            if new_locked[k] > max_avail:
-                                new_locked[k] = max_avail
-                            st.session_state.locked_to_box = new_locked
-                            st.rerun()
-
-        elif delta_box < 0:
-            # Need to REMOVE from box
-            amount = -delta_box
-            st.write("**Action:** Retirer de la boîte: " + cents_to_str(amount))
-
-            st.session_state.locked_from_box = clamp_locked(st.session_state.locked_from_box, box_now)
-            locked = dict(st.session_state.locked_from_box)
-
-            from_box, rem_from = suggest_changebox(amount, allowed_box, box_now, locked)
-
-            moved = total_cents(from_box)
-            if rem_from == 0:
-                st.success("À retirer de la boîte: " + cents_to_str(moved))
-            elif rem_from < 0:
-                st.warning("Retrait dépasse de " + cents_to_str(-rem_from) + " (verrouillage trop haut).")
+            if rem == 0:
+                st.success("Depuis boîte: " + cents_to_str(total_cents(from_box)))
             else:
-                st.warning("Impossible exact. Reste: " + cents_to_str(rem_from))
-
-            st.markdown("### Ajuster le **retrait depuis la boîte**")
-            adjust_keys = [k for k in DISPLAY_ORDER if k in allowed_box]
-            cols_per_row = 4
-            for i in range(0, len(adjust_keys), cols_per_row):
-                row_cols = st.columns(cols_per_row)
-                for j, k in enumerate(adjust_keys[i:i + cols_per_row]):
-                    with row_cols[j]:
-                        q = int(from_box.get(k, 0))
-                        max_avail = int(box_now.get(k, 0))
-
-                        st.markdown(f"**{k}**")
-                        mcol, pcol = st.columns(2)
-                        minus = mcol.button("➖", key=f"fb_minus_{k}")
-                        plus = pcol.button("➕", key=f"fb_plus_{k}")
-
-                        st.write(f"Depuis boîte: **{q}**")
-                        st.caption(f"Dispo boîte: {max_avail}")
-
-                        if minus or plus:
-                            new_locked = dict(st.session_state.locked_from_box)
-                            if k not in new_locked:
-                                new_locked[k] = q
-                            if minus:
-                                new_locked[k] = int(new_locked[k]) - 1
-                            if plus:
-                                new_locked[k] = int(new_locked[k]) + 1
-                            if new_locked[k] < 0:
-                                new_locked[k] = 0
-                            if new_locked[k] > max_avail:
-                                new_locked[k] = max_avail
-                            st.session_state.locked_from_box = new_locked
-                            st.rerun()
-
+                st.warning("Reste non couvert: " + cents_to_str(rem))
         else:
-            st.success("Boîte exactement à la cible. Aucun mouvement nécessaire.")
+            st.success("Boîte déjà exactement à la cible.")
 
-    # Apply movements to compute "after"
-    # If to_box used: register loses, box gains
-    # If from_box used: box loses (and theoretically register gains, but your boss didn't request that side explicitly)
-    box_after = clamp_counts(add_counts(sub_counts(box_now, from_box), to_box))
+    box_after = add_counts(sub_counts(st.session_state.box_now, from_box), to_box)
+    st.info("TOTAL boîte (après): " + cents_to_str(total_cents(box_after)))
 
-    box_calc_rows = rows_box_calc_table(box_now, to_box, from_box, box_after)
-    st.divider()
-    st.info("TOTAL boîte (après mouvements): " + cents_to_str(total_cents(box_after)))
+    st.session_state._box_to = to_box
+    st.session_state._box_from = from_box
+    st.session_state._box_after = box_after
 
-# ================== SAVE + DOWNLOAD ==================
+# ========================= SAVE / RECEIPT (GLOBAL) =========================
 st.divider()
-st.subheader("Sauvegarde & reçus")
+st.subheader("Sauvegarde & impression (reçu)")
 
 meta = {
-    "Date": st.session_state.active_date.isoformat(),
+    "Date": today.isoformat(),
     "Généré à": datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"),
-    "Caisse #": int(st.session_state.meta_register_no),
-    "Caissier(ère)": st.session_state.meta_cashier.strip() if st.session_state.meta_cashier.strip() else "—",
-    "Cible $": int(st.session_state.meta_target),
-    "Note": "Fichiers générés automatiquement par date.",
+    "Caisse #": int(st.session_state.register_no),
+    "Caissier(ère)": (st.session_state.cashier.strip() or "—"),
+    "Cible $": int(st.session_state.target_dollars),
+    "Cible boîte $": int(st.session_state.box_target_dollars),
 }
 
-payload = build_payload_for_save(reg_calc_rows, box_calc_rows, meta)
-autosave_if_needed(payload)
+# Build calc rows
+open_c = st.session_state.open_counts
+close_c = st.session_state.close_counts
+retrait_c = st.session_state.get("_register_retrait_counts", {k: 0 for k in DENOMS})
+restant_c = st.session_state.get("_register_restant_counts", dict(close_c))
 
-left, mid, right = st.columns([1.3, 1.3, 3.0])
-with left:
-    if st.button("Enregistrer maintenant"):
-        save_state_for(today, payload)
-        export_excel_for(today, payload)
-        st.session_state.last_saved_hash = hash_state(payload)
+rows_reg = rows_caisse(open_c, close_c, retrait_c, restant_c)
+
+box_now = st.session_state.box_now
+to_box = st.session_state.get("_box_to", {k: 0 for k in DENOMS})
+from_box = st.session_state.get("_box_from", {k: 0 for k in DENOMS})
+box_after = st.session_state.get("_box_after", box_now)
+
+rows_b = rows_box(box_now, to_box, from_box, box_after)
+
+payload = {
+    "meta": meta,
+    "register": {
+        "open_counts": open_c,
+        "close_counts": close_c,
+        "allowed_retrait": st.session_state.allowed_retrait,
+        "locked_retrait": st.session_state.locked_retrait,
+        "rows_calc": rows_reg,
+    },
+    "changebox": {
+        "box_now": box_now,
+        "allowed_box": st.session_state.allowed_box,
+        "box_target_dollars": int(st.session_state.box_target_dollars),
+        "locked_to_box": st.session_state.locked_to_box,
+        "locked_from_box": st.session_state.locked_from_box,
+        "rows_calc": rows_b,
+    },
+}
+
+def autosave(payload: dict):
+    h = hash_payload(payload)
+    if st.session_state.last_saved_hash == h:
+        return
+    save_day(today, payload)
+    save_receipt_file(today, payload)
+    st.session_state.last_saved_hash = h
+    st.session_state.last_saved_at = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+autosave(payload)
+
+c1, c2, c3, c4 = st.columns([1.3, 1.7, 2.0, 3.0])
+with c1:
+    if st.button("💾 Enregistrer maintenant"):
+        save_day(today, payload)
+        save_receipt_file(today, payload)
+        st.session_state.last_saved_hash = hash_payload(payload)
         st.session_state.last_saved_at = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
-with mid:
+with c2:
     st.write("Dernière sauvegarde:", st.session_state.last_saved_at or "—")
-with right:
-    st.caption("Les fichiers du jour sont stockés dans data/records/ (state JSON + Excel).")
+with c3:
+    st.write("Fichiers:", f"`{os.path.basename(state_path(today))}` + `{os.path.basename(receipt_path(today))}`")
+with c4:
+    st.caption("Le reçu HTML est imprimable et garde l’historique. Les desktops n’installent rien, c’est le serveur qui compte.")
 
-xlsx_path = excel_path_for(today)
-json_path = state_path_for(today)
+# Printable receipt preview + print button (embedded)
+st.markdown("### Reçu imprimable (aperçu)")
+receipt_html = build_receipt_html(payload)
+components.html(receipt_html, height=700, scrolling=True)
 
-d1, d2 = st.columns(2)
+# ========================= TAB 3: HISTORY =========================
+with tab3:
+    st.subheader("Historique / Reçus")
+    files = sorted([f for f in os.listdir(RECORDS_DIR) if f.endswith("_state.json")])
 
-with d1:
-    if os.path.exists(xlsx_path):
-        with open(xlsx_path, "rb") as f:
-            st.download_button(
-                label="📄 Télécharger le registre Excel du jour",
-                data=f,
-                file_name=os.path.basename(xlsx_path),
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+    if not files:
+        st.info("Aucun enregistrement trouvé encore.")
     else:
-        st.warning("Excel du jour non trouvé (pas encore créé).")
+        dates = [f.replace("_state.json", "") for f in files]
+        pick = st.selectbox("Choisir une date", dates, index=len(dates)-1)
 
-with d2:
-    if os.path.exists(json_path):
-        with open(json_path, "rb") as f:
-            st.download_button(
-                label="🧾 Télécharger l’état JSON du jour",
-                data=f,
-                file_name=os.path.basename(json_path),
-                mime="application/json",
-            )
-    else:
-        st.warning("État JSON non trouvé (pas encore créé).")
+        picked_date = date.fromisoformat(pick)
+        loaded = load_day(picked_date)
+
+        if not loaded:
+            st.error("Impossible de charger l’enregistrement.")
+        else:
+            st.write("**Meta**")
+            st.json(loaded.get("meta", {}))
+
+            st.markdown("### Reçu imprimable (historique)")
+            html_p = receipt_path(picked_date)
+
+            if os.path.exists(html_p):
+                with open(html_p, "r", encoding="utf-8") as f:
+                    html_doc = f.read()
+                components.html(html_doc, height=700, scrolling=True)
+
+                # Download
+                with open(html_p, "rb") as f:
+                    st.download_button(
+                        "⬇️ Télécharger le reçu HTML",
+                        data=f,
+                        file_name=os.path.basename(html_p),
+                        mime="text/html",
+                    )
+            else:
+                st.warning("Reçu HTML manquant pour cette date (il sera recréé au prochain save).")
