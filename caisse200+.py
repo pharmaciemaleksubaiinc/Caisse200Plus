@@ -200,6 +200,50 @@ def receipt_html(title: str, meta: dict, headers: list, rows: list) -> str:
     """
 
 # ================== DEFAULT TABLES ==================
+def normalize_box_deposit_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Accepts old/new versions of the deposit table and returns a clean schema:
+    columns: ["Dénomination", "Dépôt"]
+    """
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df_box_deposit_default()
+
+    df = df.copy()
+
+    # Allow older column names
+    rename_map = {
+        "Depot": "Dépôt",
+        "Dépôt billets": "Dépôt",
+        "DEPOT": "Dépôt",
+        "DEPOSIT": "Dépôt",
+    }
+    df.rename(columns={c: rename_map[c] for c in df.columns if c in rename_map}, inplace=True)
+
+    # Ensure required columns exist
+    if "Dénomination" not in df.columns:
+        # If totally broken, rebuild
+        return df_box_deposit_default()
+
+    if "Dépôt" not in df.columns:
+        df["Dépôt"] = 0
+
+    # Keep only needed columns, in order
+    df = df[["Dénomination", "Dépôt"]]
+
+    # Ensure all denom rows exist in correct order
+    existing = {str(x) for x in df["Dénomination"].tolist()}
+    missing = [k for k in DISPLAY_ORDER if k not in existing]
+    if missing:
+        df = pd.concat([df, pd.DataFrame([{"Dénomination": k, "Dépôt": 0} for k in missing])], ignore_index=True)
+
+    # Reorder to DISPLAY_ORDER
+    df["Dénomination"] = df["Dénomination"].astype(str)
+    df = df.set_index("Dénomination").reindex(DISPLAY_ORDER).fillna(0).reset_index()
+
+    # Force int deposit
+    df["Dépôt"] = pd.to_numeric(df["Dépôt"], errors="coerce").fillna(0).astype(int)
+    return df
+    
 def df_register_default():
     return pd.DataFrame([{"Dénomination": k, "OPEN": 0, "CLOSE": 0} for k in DISPLAY_ORDER])
 
@@ -259,6 +303,7 @@ if st.session_state.booted_for != today:
             st.session_state.df_box_before = pd.DataFrame(tb)
         if isinstance(td, list) and td:
             st.session_state.df_box_deposit = pd.DataFrame(td)
+            st.session_state.df_box_deposit = normalize_box_deposit_df(st.session_state.df_box_deposit)
         st.session_state.locked_withdraw_boite = sb.get("boite", {}).get("locked_withdraw", {})
 
 # ================== HEADER ==================
@@ -462,9 +507,18 @@ with tab_boite:
             key="ed_box_deposit",
         )
         st.session_state.df_box_deposit = edited_deposit
+        st.session_state.df_box_deposit = normalize_box_deposit_df(st.session_state.df_box_deposit)
 
     box_before = {r["Dénomination"]: safe_int(r["Boîte (avant)"]) for _, r in st.session_state.df_box_before.iterrows()}
-    deposit = {r["Dénomination"]: safe_int(r["Dépôt"]) for _, r in st.session_state.df_box_deposit.iterrows()}
+    deposit_col = "Dépôt" if "Dépôt" in st.session_state.df_box_deposit.columns else (
+    "Dépôt billets" if "Dépôt billets" in st.session_state.df_box_deposit.columns else None
+)
+
+if deposit_col is None:
+    st.session_state.df_box_deposit = normalize_box_deposit_df(st.session_state.df_box_deposit)
+    deposit_col = "Dépôt"
+
+deposit = {r["Dénomination"]: safe_int(r.get(deposit_col, 0)) for _, r in st.session_state.df_box_deposit.iterrows()}
 
     total_before = total_cents(box_before)
     total_deposit = total_cents(deposit)
