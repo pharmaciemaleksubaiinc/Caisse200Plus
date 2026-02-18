@@ -1,9 +1,9 @@
 # caisse200+.py
 # Registre — Caisse & Boîte (Échange)
-# Version: Modern flowing table UI
+# Version: Modern flowing table UI + dropdown mode + compact rows
 # - Auth
-# - After login: choose mode (Ouverture normale / Ouverture non effectuée)
-# - Caisse: OPEN/CLOSE inputs, RETRAIT is a clean editable field (locks only when changed), RESTANT computed
+# - Mode dropdown in "Caisse"
+# - Caisse: OPEN/CLOSE inputs, RETRAIT clean editable field (locks only when edited), RESTANT computed
 # - Totals aligned under columns
 # - Missed close mode: enter CLOSE hier -> adjust retrait hier in table -> OPEN today = RESTANT hier
 # - Boîte: enter Box Before + Deposit, allowed change, withdraw editable in-table
@@ -33,27 +33,50 @@ os.makedirs(DIR_BOITE, exist_ok=True)
 st.markdown(
     """
 <style>
-.main .block-container { padding-top: 0.65rem !important; padding-bottom: 0.85rem !important; max-width: 1600px !important; }
-h1,h2,h3 { margin-bottom: 0.30rem !important; }
+/* overall density */
+.main .block-container {
+  padding-top: 0.55rem !important;
+  padding-bottom: 0.75rem !important;
+  max-width: 1600px !important;
+}
+h1,h2,h3 { margin-bottom: 0.20rem !important; }
 
-.grid-head { font-weight: 950; font-size: 13px; opacity: .85; padding: 6px 0 8px 0; letter-spacing: 0.2px; }
-.grid-denom { font-weight: 900; font-size: 13px; line-height: 1.10; }
+/* kill extra vertical whitespace between elements */
+div[data-testid="stElementContainer"] { margin-bottom: 0.25rem !important; }
+div[data-testid="stHorizontalBlock"] { gap: 0.35rem !important; }
+div[data-testid="stVerticalBlock"] { gap: 0.20rem !important; }
+
+/* table typography */
+.grid-head { font-weight: 950; font-size: 13px; opacity: .85; padding: 4px 0 6px 0; letter-spacing: 0.2px; }
+.grid-denom { font-weight: 900; font-size: 13px; line-height: 1.05; }
 .grid-num { font-weight: 950; font-size: 13px; text-align:center; }
-.grid-cell { display:flex; align-items:center; justify-content:center; height: 2.15rem; }
+.grid-cell { display:flex; align-items:center; justify-content:center; height: 1.85rem; }
 
+/* number inputs compact */
+div[data-testid="stNumberInput"] { margin-bottom: 0rem !important; }
 div[data-testid="stNumberInput"] input {
-  height: 2.15rem !important;
-  padding: 2px 8px !important;
+  height: 1.85rem !important;
+  padding: 1px 7px !important;
   font-weight: 950 !important;
 }
-div[data-testid="stHorizontalBlock"] { gap: 0.45rem !important; }
 
-.hr-tight { margin: 0.35rem 0 0.65rem 0; }
+/* selectbox compact */
+div[data-testid="stSelectbox"] { margin-bottom: 0rem !important; }
+
+/* section separators */
+.hr-tight { margin: 0.25rem 0 0.55rem 0; }
 .smallcap { opacity: .70; font-size: 12px; }
 
+/* totals */
 .totals-label { font-weight: 950; font-size: 12px; opacity: .70; }
-.totals-val { font-weight: 990; font-size: 15px; padding: 10px 12px; border-radius: 14px; background: rgba(0,0,0,0.04); text-align:center; }
-
+.totals-val {
+  font-weight: 990;
+  font-size: 14px;
+  padding: 8px 10px;
+  border-radius: 14px;
+  background: rgba(0,0,0,0.045);
+  text-align:center;
+}
 </style>
 """,
     unsafe_allow_html=True,
@@ -312,13 +335,11 @@ def modern_grid(
         else:
             row[2].markdown(f"<div class='grid-cell'><div class='grid-num'>{close_val}</div></div>", unsafe_allow_html=True)
 
-        # RETRAIT (modern editable input)
+        # RETRAIT (editable input, locks only if touched)
         q_suggest = int(retrait_suggested.get(k, 0))
         mx = int(avail_for_retrait.get(k, 0))
-
         w_ret = f"{widget_prefix}__ret__{k}"
 
-        # If user never locked this denom, keep retrait input synced to suggestion automatically.
         if k not in locked:
             st.session_state[w_ret] = q_suggest
 
@@ -362,11 +383,13 @@ today = datetime.now(TZ).date()
 yesterday = today - timedelta(days=1)
 
 if "mode_pick" not in st.session_state:
-    st.session_state.mode_pick = None
+    st.session_state.mode_pick = "normal"  # default
 if "mode_done_today" not in st.session_state:
-    st.session_state.mode_done_today = None
+    st.session_state.mode_done_today = today.isoformat()
+
 if st.session_state.mode_done_today != today.isoformat():
-    st.session_state.mode_pick = None
+    st.session_state.mode_done_today = today.isoformat()
+    # keep last mode_pick as-is (user preference), but you can reset if you want
 
 if "cashier" not in st.session_state:
     st.session_state.cashier = ""
@@ -394,11 +417,30 @@ if "last_hash_boite" not in st.session_state:
 if "booted_for" not in st.session_state:
     st.session_state.booted_for = None
 
+def apply_mode_change(new_mode: str):
+    old = st.session_state.mode_pick
+    st.session_state.mode_pick = new_mode
+    st.session_state.mode_done_today = today.isoformat()
+
+    # On mode switch, clear only the stuff that makes UI confusing
+    if old != new_mode:
+        # clear lock dicts for safety (prevents weird carry-over)
+        st.session_state.locked_retrait_caisse = {}
+        st.session_state.locked_retrait_hier = {}
+
+        # Also clear RETRAIT widget caches so they re-sync properly
+        # (we only delete keys we own)
+        for k in list(st.session_state.keys()):
+            if isinstance(k, str) and ("TODAY__ret__" in k or "YEST__ret__" in k or "BOITE__ret__" in k):
+                del st.session_state[k]
+
+        st.rerun()
+
 if st.session_state.booted_for != today.isoformat():
     st.session_state.booted_for = today.isoformat()
 
     # Caisse saved
-    state_path_c, _ = caisse_paths(today)
+    state_path_c = os.path.join(DIR_CAISSE, f"{today.isoformat()}_state.json")
     saved = load_json(state_path_c)
     if saved:
         meta = saved.get("meta", {})
@@ -416,7 +458,7 @@ if st.session_state.booted_for != today.isoformat():
         st.session_state.locked_retrait_hier = saved.get("locked_retrait_hier", {}) or {}
 
     # Boîte saved
-    state_path_b, _ = boite_paths(today)
+    state_path_b = os.path.join(DIR_BOITE, f"{today.isoformat()}_state.json")
     savedb = load_json(state_path_b)
     if savedb:
         st.session_state.boite_allowed = set(savedb.get("boite_allowed", list(st.session_state.boite_allowed)))
@@ -425,24 +467,6 @@ if st.session_state.booted_for != today.isoformat():
             if isinstance(dct, dict):
                 st.session_state[name] = dct
         st.session_state.locked_withdraw_boite = savedb.get("locked_withdraw_boite", {}) or {}
-
-
-# ================== MODE PICKER ==================
-if st.session_state.mode_pick is None:
-    st.title("Choix d'ouverture")
-    st.caption("Sélectionne le scénario d'aujourd'hui.")
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("✅ Ouverture normale", use_container_width=True, key="pick_normal"):
-            st.session_state.mode_pick = "normal"
-            st.session_state.mode_done_today = today.isoformat()
-            st.rerun()
-    with c2:
-        if st.button("⚠️ Ouverture non effectuée (hier)", use_container_width=True, key="pick_missed"):
-            st.session_state.mode_pick = "missed_close"
-            st.session_state.mode_done_today = today.isoformat()
-            st.rerun()
-    st.stop()
 
 
 # ================== HEADER ==================
@@ -474,6 +498,24 @@ with tab_caisse:
 
     st.subheader("Caisse")
 
+    # ---- MODE DROPDOWN (here, like you asked) ----
+    mode_labels = {
+        "normal": "Ouverture normale",
+        "missed_close": "Fermeture non effectuée (hier)",
+    }
+    mode_options = ["normal", "missed_close"]
+    current_idx = mode_options.index(st.session_state.mode_pick) if st.session_state.mode_pick in mode_options else 0
+
+    picked = st.selectbox(
+        "Mode",
+        options=mode_options,
+        format_func=lambda x: mode_labels.get(x, x),
+        index=current_idx,
+        key="mode_dropdown",
+    )
+    if picked != st.session_state.mode_pick:
+        apply_mode_change(picked)
+
     OPEN_T = "caisse_open_today"
     CLOSE_T = "caisse_close_today"
     CLOSE_Y = "caisse_close_yesterday"
@@ -492,7 +534,7 @@ with tab_caisse:
     remaining_y = 0
 
     if st.session_state.mode_pick == "missed_close":
-        st.markdown("### ⚠️ Hier — fermeture non effectuée")
+        st.markdown("#### ⚠️ Hier — fermeture non effectuée")
         st.caption("Entre le CLOSE d'hier et ajuste le RETRAIT directement dans la table. OPEN d'aujourd'hui = RESTANT d'hier.")
 
         if diff_y > 0:
@@ -550,7 +592,7 @@ with tab_caisse:
         st.session_state[OPEN_T] = open_today_dict
 
         st.markdown("<hr class='hr-tight'/>", unsafe_allow_html=True)
-        st.markdown("### ✅ Aujourd'hui — OPEN pré-rempli (RESTANT d'hier)")
+        st.markdown("#### ✅ Aujourd'hui — OPEN pré-rempli (RESTANT d'hier)")
     else:
         st.caption("Ouverture normale: entre OPEN et CLOSE. Ajuste le RETRAIT directement dans la table.")
 
@@ -639,7 +681,7 @@ with tab_caisse:
         "Caisse #": int(st.session_state.register_no),
         "Caissier(ère)": (st.session_state.cashier.strip() or "—"),
         "Cible $": int(st.session_state.target_dollars),
-        "Mode": "Ouverture non effectuée" if st.session_state.mode_pick == "missed_close" else "Ouverture normale",
+        "Mode": mode_labels.get(st.session_state.mode_pick, st.session_state.mode_pick),
     }
 
     payload_caisse = {
