@@ -1,6 +1,6 @@
 # caisse200+.py
 # Registre — Caisse & Boîte (Échange)
-# Version: Inline RETRAIT adjustment in table + aligned totals + shorter (split) tables
+# Version: Inline RETRAIT adjustment in table (no nested columns) + aligned totals + shorter tables
 # - Auth
 # - After login: choose mode (Ouverture normale / Ouverture non effectuée)
 # - Caisse: OPEN/CLOSE inputs, RETRAIT inline +/- (locks), RESTANT computed
@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 import streamlit as st
 import streamlit.components.v1 as components
 
+
 # ================== CONFIG ==================
 st.set_page_config(page_title="Registre — Caisse & Boîte", layout="wide")
 TZ = ZoneInfo("America/Toronto")
@@ -27,6 +28,7 @@ DIR_CAISSE = os.path.join(BASE_DIR, "records_caisse")
 DIR_BOITE = os.path.join(BASE_DIR, "records_boite")
 os.makedirs(DIR_CAISSE, exist_ok=True)
 os.makedirs(DIR_BOITE, exist_ok=True)
+
 
 # ================== STYLE ==================
 st.markdown(
@@ -38,26 +40,29 @@ h1,h2,h3 { margin-bottom: 0.25rem !important; }
 .grid-head { font-weight: 950; font-size: 13px; opacity: .85; padding: 2px 0; }
 .grid-denom { font-weight: 950; font-size: 13px; line-height: 1.05; }
 .grid-num { font-weight: 950; font-size: 13px; text-align:center; }
+.grid-mid { display:flex; justify-content:center; align-items:center; height: 2.05rem; }
 
 button[kind="secondary"] { font-weight: 850 !important; }
 
-/* shrink Streamlit number inputs (less vertical space) */
+/* shrink Streamlit number inputs */
 div[data-testid="stNumberInput"] input {
   height: 2.05rem !important;
   padding: 2px 6px !important;
   font-weight: 950 !important;
 }
+
 div[data-testid="stHorizontalBlock"] { gap: 0.35rem !important; }
 
 .totals-row-label { font-weight: 950; font-size: 13px; opacity: .85; }
 .totals-row-num { font-weight: 990; font-size: 13px; text-align:center; }
 
-.smallcap { opacity: .70; font-size: 12px; }
 .hr-tight { margin: 0.4rem 0 0.6rem 0; }
+.smallcap { opacity: .70; font-size: 12px; }
 </style>
 """,
     unsafe_allow_html=True,
 )
+
 
 # ================== DENOMS ==================
 DENOMS = {
@@ -89,6 +94,7 @@ ROLLS = [
     "Rouleau 0,05 $ (40) — 2 $",
 ]
 DISPLAY_ORDER = BILLS_BIG + BILLS_SMALL + COINS + ROLLS
+
 
 # ================== HELPERS ==================
 def cents_to_str(c: int) -> str:
@@ -227,7 +233,8 @@ def receipt_html(title: str, meta: dict, headers: list, rows: list) -> str:
     </body></html>
     """
 
-# ================== SESSION / INPUT HELPERS ==================
+
+# ================== SESSION HELPERS ==================
 def ensure_counts(prefix: str, keys: list):
     if prefix not in st.session_state:
         st.session_state[prefix] = {k: 0 for k in keys}
@@ -242,37 +249,48 @@ def seed_widget_int(widget_key: str, default: int):
     if widget_key not in st.session_state:
         st.session_state[widget_key] = int(default)
 
-def grid_header(labels):
-    cols = st.columns([2.8, 1.2, 1.2, 1.6, 1.6])
-    for c, lab in zip(cols, labels):
-        c.markdown(f"<div class='grid-head'>{lab}</div>", unsafe_allow_html=True)
-    return cols
 
-def totals_row(label: str, total_open: int, total_close: int, total_retrait: int, total_restant: int):
-    cols = st.columns([2.8, 1.2, 1.2, 1.6, 1.6], vertical_alignment="center")
+# ================== TABLE BUILDERS (NO NESTED COLUMNS) ==================
+# Columns layout: Denom | OPEN | CLOSE | (-) | RETRAIT | (+) | RESTANT
+COLS_WEIGHTS = [2.8, 1.2, 1.2, 0.55, 0.5, 0.55, 1.6]
+
+def table_header_caisse():
+    cols = st.columns(COLS_WEIGHTS)
+    cols[0].markdown("<div class='grid-head'>Dénomination</div>", unsafe_allow_html=True)
+    cols[1].markdown("<div class='grid-head'>OPEN</div>", unsafe_allow_html=True)
+    cols[2].markdown("<div class='grid-head'>CLOSE</div>", unsafe_allow_html=True)
+    cols[3].markdown("<div class='grid-head'> </div>", unsafe_allow_html=True)
+    cols[4].markdown("<div class='grid-head'>RETRAIT</div>", unsafe_allow_html=True)
+    cols[5].markdown("<div class='grid-head'> </div>", unsafe_allow_html=True)
+    cols[6].markdown("<div class='grid-head'>RESTANT</div>", unsafe_allow_html=True)
+
+def table_header_boite():
+    cols = st.columns(COLS_WEIGHTS)
+    cols[0].markdown("<div class='grid-head'>Dénomination</div>", unsafe_allow_html=True)
+    cols[1].markdown("<div class='grid-head'>Boîte (avant)</div>", unsafe_allow_html=True)
+    cols[2].markdown("<div class='grid-head'>Dépôt</div>", unsafe_allow_html=True)
+    cols[3].markdown("<div class='grid-head'> </div>", unsafe_allow_html=True)
+    cols[4].markdown("<div class='grid-head'>Change retiré</div>", unsafe_allow_html=True)
+    cols[5].markdown("<div class='grid-head'> </div>", unsafe_allow_html=True)
+    cols[6].markdown("<div class='grid-head'>Boîte (après)</div>", unsafe_allow_html=True)
+
+def totals_row_aligned(label: str, a: int, b: int, retrait: int, restant: int):
+    cols = st.columns(COLS_WEIGHTS, vertical_alignment="center")
     cols[0].markdown(f"<div class='totals-row-label'>{label}</div>", unsafe_allow_html=True)
-    cols[1].markdown(f"<div class='totals-row-num'>{total_open/100:.2f} $</div>", unsafe_allow_html=True)
-    cols[2].markdown(f"<div class='totals-row-num'>{total_close/100:.2f} $</div>", unsafe_allow_html=True)
-    cols[3].markdown(f"<div class='totals-row-num'>{total_retrait/100:.2f} $</div>", unsafe_allow_html=True)
-    cols[4].markdown(f"<div class='totals-row-num'>{total_restant/100:.2f} $</div>", unsafe_allow_html=True)
+    cols[1].markdown(f"<div class='totals-row-num'>{a/100:.2f} $</div>", unsafe_allow_html=True)
+    cols[2].markdown(f"<div class='totals-row-num'>{b/100:.2f} $</div>", unsafe_allow_html=True)
+    cols[3].markdown("", unsafe_allow_html=True)
+    cols[4].markdown(f"<div class='totals-row-num'>{retrait/100:.2f} $</div>", unsafe_allow_html=True)
+    cols[5].markdown("", unsafe_allow_html=True)
+    cols[6].markdown(f"<div class='totals-row-num'>{restant/100:.2f} $</div>", unsafe_allow_html=True)
 
-def inline_retrait_cell(q: int, mx: int, lock_name: str, denom_key: str, btn_prefix: str):
-    # 3 mini columns inside the RETRAIT cell
-    cmin, cval, cplus = st.columns([0.52, 0.96, 0.52], vertical_alignment="center")
-    minus = cmin.button("➖", key=f"{btn_prefix}_minus_{denom_key}")
-    cval.markdown(f"<div class='grid-num'>{q}</div>", unsafe_allow_html=True)
-    plus = cplus.button("➕", key=f"{btn_prefix}_plus_{denom_key}")
-
-    if minus or plus:
-        locked = dict(st.session_state.get(lock_name, {}) or {})
-        if denom_key not in locked:
-            locked[denom_key] = q
-        if minus:
-            locked[denom_key] = max(0, int(locked[denom_key]) - 1)
-        if plus:
-            locked[denom_key] = min(mx, int(locked[denom_key]) + 1)
-        st.session_state[lock_name] = locked
-        st.rerun()
+def adjust_lock(lock_name: str, denom_key: str, current_q: int, mx: int, delta: int):
+    locked = dict(st.session_state.get(lock_name, {}) or {})
+    if denom_key not in locked:
+        locked[denom_key] = int(current_q)
+    locked[denom_key] = max(0, min(int(mx), int(locked[denom_key]) + int(delta)))
+    st.session_state[lock_name] = locked
+    st.rerun()
 
 def caisse_table_half(
     keys_subset: list,
@@ -290,15 +308,15 @@ def caisse_table_half(
     ensure_counts(open_prefix, DISPLAY_ORDER)
     ensure_counts(close_prefix, DISPLAY_ORDER)
 
-    grid_header(["Dénomination", "OPEN", "CLOSE", "RETRAIT", "RESTANT"])
+    table_header_caisse()
 
     for k in keys_subset:
-        row = st.columns([2.8, 1.2, 1.2, 1.6, 1.6], vertical_alignment="center")
+        row = st.columns(COLS_WEIGHTS, vertical_alignment="center")
         row[0].markdown(f"<div class='grid-denom'>{k}</div>", unsafe_allow_html=True)
 
         # OPEN
         open_val = int(st.session_state[open_prefix].get(k, 0))
-        wkey_open = f"{open_prefix}__{k}"
+        wkey_open = f"{open_prefix}__{btn_prefix}__{k}"
         seed_widget_int(wkey_open, open_val)
         if allow_edit_open:
             v = row[1].number_input("", min_value=0, step=1, key=wkey_open)
@@ -308,7 +326,7 @@ def caisse_table_half(
 
         # CLOSE
         close_val = int(st.session_state[close_prefix].get(k, 0))
-        wkey_close = f"{close_prefix}__{k}"
+        wkey_close = f"{close_prefix}__{btn_prefix}__{k}"
         seed_widget_int(wkey_close, close_val)
         if allow_edit_close:
             v = row[2].number_input("", min_value=0, step=1, key=wkey_close)
@@ -316,16 +334,21 @@ def caisse_table_half(
         else:
             row[2].markdown(f"<div class='grid-num'>{close_val}</div>", unsafe_allow_html=True)
 
-        # RETRAIT inline +/- or fixed
         q = int(retrait_counts.get(k, 0))
-        if allow_adjust_retrait:
-            with row[3]:
-                inline_retrait_cell(q=q, mx=int(close_avail.get(k, 0)), lock_name=lock_name, denom_key=k, btn_prefix=btn_prefix)
-        else:
-            row[3].markdown(f"<div class='grid-num'>{q}</div>", unsafe_allow_html=True)
+        mx = int(close_avail.get(k, 0))
 
-        # RESTANT
-        row[4].markdown(f"<div class='grid-num'>{int(restant_counts.get(k, 0))}</div>", unsafe_allow_html=True)
+        if allow_adjust_retrait:
+            if row[3].button("➖", key=f"{btn_prefix}_minus_{k}"):
+                adjust_lock(lock_name, k, q, mx, -1)
+            row[4].markdown(f"<div class='grid-mid'><div class='grid-num'>{q}</div></div>", unsafe_allow_html=True)
+            if row[5].button("➕", key=f"{btn_prefix}_plus_{k}"):
+                adjust_lock(lock_name, k, q, mx, +1)
+        else:
+            row[3].markdown("")
+            row[4].markdown(f"<div class='grid-mid'><div class='grid-num'>{q}</div></div>", unsafe_allow_html=True)
+            row[5].markdown("")
+
+        row[6].markdown(f"<div class='grid-num'>{int(restant_counts.get(k, 0))}</div>", unsafe_allow_html=True)
 
 def boite_table_half(
     keys_subset: list,
@@ -343,15 +366,15 @@ def boite_table_half(
     ensure_counts(before_prefix, DISPLAY_ORDER)
     ensure_counts(deposit_prefix, DISPLAY_ORDER)
 
-    grid_header(["Dénomination", "Boîte (avant)", "Dépôt", "Change retiré", "Boîte (après)"])
+    table_header_boite()
 
     for k in keys_subset:
-        row = st.columns([2.8, 1.2, 1.2, 1.6, 1.6], vertical_alignment="center")
+        row = st.columns(COLS_WEIGHTS, vertical_alignment="center")
         row[0].markdown(f"<div class='grid-denom'>{k}</div>", unsafe_allow_html=True)
 
         # BEFORE
         bval = int(st.session_state[before_prefix].get(k, 0))
-        wkey_b = f"{before_prefix}__{k}"
+        wkey_b = f"{before_prefix}__{btn_prefix}__{k}"
         seed_widget_int(wkey_b, bval)
         if allow_edit_before:
             v = row[1].number_input("", min_value=0, step=1, key=wkey_b)
@@ -361,7 +384,7 @@ def boite_table_half(
 
         # DEPOSIT
         dval = int(st.session_state[deposit_prefix].get(k, 0))
-        wkey_d = f"{deposit_prefix}__{k}"
+        wkey_d = f"{deposit_prefix}__{btn_prefix}__{k}"
         seed_widget_int(wkey_d, dval)
         if allow_edit_deposit:
             v = row[2].number_input("", min_value=0, step=1, key=wkey_d)
@@ -369,16 +392,22 @@ def boite_table_half(
         else:
             row[2].markdown(f"<div class='grid-num'>{dval}</div>", unsafe_allow_html=True)
 
-        # WITHDRAW inline +/- or fixed
         q = int(withdraw_counts.get(k, 0))
-        if allow_adjust_withdraw:
-            with row[3]:
-                inline_retrait_cell(q=q, mx=int(avail_after_deposit.get(k, 0)), lock_name=lock_name, denom_key=k, btn_prefix=btn_prefix)
-        else:
-            row[3].markdown(f"<div class='grid-num'>{q}</div>", unsafe_allow_html=True)
+        mx = int(avail_after_deposit.get(k, 0))
 
-        # AFTER
-        row[4].markdown(f"<div class='grid-num'>{int(after_counts.get(k, 0))}</div>", unsafe_allow_html=True)
+        if allow_adjust_withdraw:
+            if row[3].button("➖", key=f"{btn_prefix}_minus_{k}"):
+                adjust_lock(lock_name, k, q, mx, -1)
+            row[4].markdown(f"<div class='grid-mid'><div class='grid-num'>{q}</div></div>", unsafe_allow_html=True)
+            if row[5].button("➕", key=f"{btn_prefix}_plus_{k}"):
+                adjust_lock(lock_name, k, q, mx, +1)
+        else:
+            row[3].markdown("")
+            row[4].markdown(f"<div class='grid-mid'><div class='grid-num'>{q}</div></div>", unsafe_allow_html=True)
+            row[5].markdown("")
+
+        row[6].markdown(f"<div class='grid-num'>{int(after_counts.get(k, 0))}</div>", unsafe_allow_html=True)
+
 
 # ================== AUTH ==================
 if "auth" not in st.session_state:
@@ -395,6 +424,7 @@ if not st.session_state.auth:
             st.error("Mot de passe incorrect.")
     st.stop()
 
+
 # ================== GLOBAL STATE ==================
 today = datetime.now(TZ).date()
 yesterday = today - timedelta(days=1)
@@ -407,7 +437,6 @@ if "mode_done_today" not in st.session_state:
 if st.session_state.mode_done_today != today.isoformat():
     st.session_state.mode_pick = None
 
-# App meta state
 if "cashier" not in st.session_state:
     st.session_state.cashier = ""
 if "register_no" not in st.session_state:
@@ -415,7 +444,6 @@ if "register_no" not in st.session_state:
 if "target_dollars" not in st.session_state:
     st.session_state.target_dollars = 200
 
-# Locks
 if "locked_retrait_caisse" not in st.session_state:
     st.session_state.locked_retrait_caisse = {}
 if "locked_retrait_hier" not in st.session_state:
@@ -426,20 +454,18 @@ if "boite_allowed" not in st.session_state:
 if "locked_withdraw_boite" not in st.session_state:
     st.session_state.locked_withdraw_boite = {}
 
-# autosave hashes
 if "last_hash_caisse" not in st.session_state:
     st.session_state.last_hash_caisse = None
 if "last_hash_boite" not in st.session_state:
     st.session_state.last_hash_boite = None
 
-# Load saved state once per day
 if "booted_for" not in st.session_state:
     st.session_state.booted_for = None
 
+# Load saved state once per day
 if st.session_state.booted_for != today.isoformat():
     st.session_state.booted_for = today.isoformat()
 
-    # Caisse saved
     state_path_c, _ = caisse_paths(today)
     saved = load_json(state_path_c)
     if saved:
@@ -457,7 +483,6 @@ if st.session_state.booted_for != today.isoformat():
         st.session_state.locked_retrait_caisse = saved.get("locked_retrait_caisse", {}) or {}
         st.session_state.locked_retrait_hier = saved.get("locked_retrait_hier", {}) or {}
 
-    # Boîte saved
     state_path_b, _ = boite_paths(today)
     savedb = load_json(state_path_b)
     if savedb:
@@ -467,6 +492,7 @@ if st.session_state.booted_for != today.isoformat():
             if isinstance(dct, dict):
                 st.session_state[name] = dct
         st.session_state.locked_withdraw_boite = savedb.get("locked_withdraw_boite", {}) or {}
+
 
 # ================== MODE PICKER ==================
 if st.session_state.mode_pick is None:
@@ -484,6 +510,7 @@ if st.session_state.mode_pick is None:
             st.session_state.mode_done_today = today.isoformat()
             st.rerun()
     st.stop()
+
 
 # ================== HEADER ==================
 st.title("Registre — Caisse & Boîte de monnaie")
@@ -503,6 +530,7 @@ st.session_state.target_dollars = st.number_input("Cible à laisser ($)", min_va
 st.markdown("<hr class='hr-tight'/>", unsafe_allow_html=True)
 tab_caisse, tab_boite, tab_save = st.tabs(["1) Caisse", "2) Boîte (Échange)", "3) Sauvegarde & reçus"])
 
+
 # ================== TAB: CAISSE ==================
 with tab_caisse:
     TARGET = int(st.session_state.target_dollars) * 100
@@ -513,11 +541,8 @@ with tab_caisse:
 
     st.subheader("Caisse")
 
-    # Prefixes for today
     OPEN_T = "caisse_open_today"
     CLOSE_T = "caisse_close_today"
-
-    # Prefixes for yesterday (missed close mode)
     CLOSE_Y = "caisse_close_yesterday"
 
     ensure_counts(OPEN_T, DISPLAY_ORDER)
@@ -527,12 +552,13 @@ with tab_caisse:
     left_keys = DISPLAY_ORDER[:len(DISPLAY_ORDER)//2]
     right_keys = DISPLAY_ORDER[len(DISPLAY_ORDER)//2:]
 
-    # ---- MISSED CLOSE (YESTERDAY) ----
+    # ---------- YESTERDAY (MISSED CLOSE) ----------
     close_y = get_counts(CLOSE_Y)
-    retrait_y = {k: 0 for k in DISPLAY_ORDER}
-    restant_y = dict(close_y)
     total_close_y = total_cents(close_y)
     diff_y = total_close_y - TARGET
+
+    retrait_y = {k: 0 for k in DISPLAY_ORDER}
+    restant_y = dict(close_y)
     remaining_y = 0
 
     if st.session_state.mode_pick == "missed_close":
@@ -551,12 +577,11 @@ with tab_caisse:
             retrait_y = dict(retrait_y_full)
             restant_y = sub_counts(close_y, retrait_y)
 
-        # Two halves for yesterday
         cL, cR = st.columns(2)
         with cL:
             caisse_table_half(
                 keys_subset=left_keys,
-                open_prefix="__dummy_open_y",   # not editable / not used
+                open_prefix="__dummy_open_y",
                 close_prefix=CLOSE_Y,
                 close_avail=close_y,
                 retrait_counts=retrait_y,
@@ -567,13 +592,7 @@ with tab_caisse:
                 lock_name="locked_retrait_hier",
                 btn_prefix="yL",
             )
-            totals_row(
-                "TOTAL ($)",
-                total_open=0,
-                total_close=total_close_y,
-                total_retrait=total_cents(retrait_y),
-                total_restant=total_cents(restant_y),
-            )
+            totals_row_aligned("TOTAL ($)", 0, total_close_y, total_cents(retrait_y), total_cents(restant_y))
 
         with cR:
             caisse_table_half(
@@ -589,15 +608,8 @@ with tab_caisse:
                 lock_name="locked_retrait_hier",
                 btn_prefix="yR",
             )
-            totals_row(
-                "TOTAL ($)",
-                total_open=0,
-                total_close=total_close_y,
-                total_retrait=total_cents(retrait_y),
-                total_restant=total_cents(restant_y),
-            )
+            totals_row_aligned("TOTAL ($)", 0, total_close_y, total_cents(retrait_y), total_cents(restant_y))
 
-        # Status + reset
         if diff_y <= 0:
             st.info("Hier: sous la cible (ou égal). Aucun retrait.")
         else:
@@ -612,7 +624,7 @@ with tab_caisse:
                 st.session_state.locked_retrait_hier = {}
                 st.rerun()
 
-        # Populate OPEN today from restant_y
+        # OPEN today = RESTANT yesterday
         open_today_dict = get_counts(OPEN_T)
         for k in DISPLAY_ORDER:
             open_today_dict[k] = int(restant_y.get(k, 0))
@@ -620,11 +632,10 @@ with tab_caisse:
 
         st.markdown("<hr class='hr-tight'/>", unsafe_allow_html=True)
         st.markdown("### ✅ Aujourd'hui — OPEN pré-rempli (RESTANT d'hier)")
-
     else:
-        st.caption("Ouverture normale: entre OPEN (matin) et CLOSE (fin de journée). Ajuste le RETRAIT directement dans le tableau.")
+        st.caption("Ouverture normale: entre OPEN et CLOSE. Ajuste le RETRAIT directement dans le tableau.")
 
-    # ---- TODAY COMPUTE ----
+    # ---------- TODAY ----------
     open_today = get_counts(OPEN_T)
     close_today = get_counts(CLOSE_T)
 
@@ -648,7 +659,6 @@ with tab_caisse:
         retrait_today = dict(retrait_today_full)
         restant_today = sub_counts(close_today, retrait_today)
 
-    # ---- TODAY TABLE (split) ----
     tL, tR = st.columns(2)
     with tL:
         caisse_table_half(
@@ -664,13 +674,7 @@ with tab_caisse:
             lock_name="locked_retrait_caisse",
             btn_prefix="tL",
         )
-        totals_row(
-            "TOTAL ($)",
-            total_open=total_open_today,
-            total_close=total_close_today,
-            total_retrait=total_cents(retrait_today),
-            total_restant=total_cents(restant_today),
-        )
+        totals_row_aligned("TOTAL ($)", total_open_today, total_close_today, total_cents(retrait_today), total_cents(restant_today))
 
     with tR:
         caisse_table_half(
@@ -686,15 +690,8 @@ with tab_caisse:
             lock_name="locked_retrait_caisse",
             btn_prefix="tR",
         )
-        totals_row(
-            "TOTAL ($)",
-            total_open=total_open_today,
-            total_close=total_close_today,
-            total_retrait=total_cents(retrait_today),
-            total_restant=total_cents(restant_today),
-        )
+        totals_row_aligned("TOTAL ($)", total_open_today, total_close_today, total_cents(retrait_today), total_cents(restant_today))
 
-    # Status + reset
     if diff_today <= 0:
         st.info("Sous la cible (ou égal). Aucun retrait.")
     else:
@@ -709,7 +706,7 @@ with tab_caisse:
             st.session_state.locked_retrait_caisse = {}
             st.rerun()
 
-    # ---- RECEIPT (today) ----
+    # Receipt rows (today)
     rows_today = []
     for k in DISPLAY_ORDER:
         rows_today.append({
@@ -757,18 +754,16 @@ with tab_caisse:
         save_json(state_path, payload_caisse)
         save_text(receipt_path, html)
         st.session_state.last_hash_caisse = hc
-    else:
-        html = load_text(receipt_path) or ""
 
     st.markdown("### Aperçu reçu — Caisse")
-    components.html(load_text(receipt_path) or html, height=620, scrolling=True)
+    components.html(load_text(receipt_path) or "", height=620, scrolling=True)
+
 
 # ================== TAB: BOÎTE ==================
 with tab_boite:
     st.subheader("Boîte (Échange)")
     st.caption("Entre la boîte + dépôt. Ajuste le change retiré directement dans le tableau (➖/➕).")
 
-    # Allowed denom selection
     with st.expander("⚙️ Types autorisés pour le change", expanded=True):
         allowed = set(st.session_state.boite_allowed)
         c1, c2, c3 = st.columns(3)
@@ -840,13 +835,7 @@ with tab_boite:
             lock_name="locked_withdraw_boite",
             btn_prefix="bL",
         )
-        totals_row(
-            "TOTAL ($)",
-            total_open=total_before,
-            total_close=total_deposit,
-            total_retrait=total_cents(withdraw),
-            total_restant=total_cents(box_after),
-        )
+        totals_row_aligned("TOTAL ($)", total_before, total_deposit, total_cents(withdraw), total_cents(box_after))
 
     with bR:
         boite_table_half(
@@ -862,15 +851,8 @@ with tab_boite:
             lock_name="locked_withdraw_boite",
             btn_prefix="bR",
         )
-        totals_row(
-            "TOTAL ($)",
-            total_open=total_before,
-            total_close=total_deposit,
-            total_retrait=total_cents(withdraw),
-            total_restant=total_cents(box_after),
-        )
+        totals_row_aligned("TOTAL ($)", total_before, total_deposit, total_cents(withdraw), total_cents(box_after))
 
-    # Status + reset
     if total_deposit == 0:
         st.info("Dépôt = 0. Rien à calculer.")
     elif not st.session_state.boite_allowed:
@@ -887,7 +869,6 @@ with tab_boite:
             st.session_state.locked_withdraw_boite = {}
             st.rerun()
 
-    # Receipt (boîte)
     rows_boite = []
     for k in DISPLAY_ORDER:
         rows_boite.append({
@@ -937,11 +918,10 @@ with tab_boite:
         save_json(state_path_b, payload_boite)
         save_text(receipt_path_b, htmlb)
         st.session_state.last_hash_boite = hb
-    else:
-        htmlb = load_text(receipt_path_b) or ""
 
     st.markdown("### Aperçu reçu — Boîte (Échange)")
-    components.html(load_text(receipt_path_b) or htmlb, height=620, scrolling=True)
+    components.html(load_text(receipt_path_b) or "", height=620, scrolling=True)
+
 
 # ================== TAB: SAUVEGARDE ==================
 with tab_save:
