@@ -1,17 +1,26 @@
 # caisse200+.py
 # Registre — Caisse & Boîte (Échange)
-# - 3 tabs: CAISSE / BOÎTE / SAUVEGARDE
-# - Bold tables + auto height to avoid scrolling even when screen has space
-# - Report-style tables: computed cols on same line
-# - Inline +/- controls aligned per denomination (below table)
-# - Boîte: choose allowed denominations (checkboxes)
-# - Autosave daily: JSON state + printable HTML receipt (separate folders)
-# - Fix: "type then Enter resets to 0" by LIVE normalisation (no aggressive reindex mid-edit)
+#
+# FIXES / FEATURES:
+# - Fix "enter resets value to 0" in st.data_editor:
+#   * never reindex/rebuild df during live editing
+#   * preserve user's typed values; only coerce numeric gently
+#   * compute-only columns updated without touching editable cols
+#
+# - After login: choose mode
+#   1) Ouverture normale
+#   2) Ouverture non effectuée (si CLOSE d'hier absent) => enter CLOSE hier, calc RETRAIT hier, OPEN aujourd'hui = RESTANT hier
+#
+# - Caisse table: OPEN/CLOSE/RETRAIT/RESTANT on one line
+# - Totals displayed UNDER each column (OPEN total, CLOSE total, À retirer, RESTANT total)
+# - Inline +/- controls for RETRAIT (Caisse) and Change retiré (Boîte)
+# - Boîte: choose allowed denominations for change; separate receipt + folder
+# - Sauvegarde tab: date list -> expands to receipt + downloads
 
 import os
 import json
 import hashlib
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -29,100 +38,23 @@ DIR_BOITE = os.path.join(BASE_DIR, "records_boite")
 os.makedirs(DIR_CAISSE, exist_ok=True)
 os.makedirs(DIR_BOITE, exist_ok=True)
 
-# ================== STYLE (BOLD + SPACE) ==================
-st.markdown("""
+# ================== STYLE ==================
+st.markdown(
+    """
 <style>
-/* Bold table text (data_editor) */
-div[data-testid="stDataFrame"] * {
-  font-weight: 700 !important;
-}
-div[data-testid="stDataFrame"] thead th {
-  font-weight: 900 !important;
-  font-size: 15px !important;
-}
-div[data-testid="stDataFrame"] tbody td {
-  font-size: 15px !important;
-}
+div[data-testid="stDataFrame"] * { font-weight: 780 !important; }
+div[data-testid="stDataFrame"] thead th { font-weight: 950 !important; font-size: 15px !important; }
+div[data-testid="stDataFrame"] tbody td { font-size: 15px !important; }
 
-/* Reduce vertical padding so more content fits without scroll */
-.main .block-container {
-  padding-top: 0.8rem !important;
-  padding-bottom: 0.8rem !important;
-  max-width: 1400px !important;
-}
+.main .block-container { padding-top: 0.8rem !important; padding-bottom: 0.8rem !important; max-width: 1500px !important; }
+h1,h2,h3 { margin-bottom: 0.35rem !important; }
 
-/* Reduce margins on headers */
-h1, h2, h3 {
-  margin-bottom: 0.35rem !important;
-}
+.totals-label { font-weight: 900; font-size: 14px; opacity: 0.75; margin-bottom: 6px; }
+.totals-box { font-weight: 950; font-size: 18px; padding: 12px; border-radius: 14px; background: rgba(0,0,0,0.04); text-align:center; }
 </style>
-""", unsafe_allow_html=True)
-
-
-# ================== VIEWPORT HEIGHT (AUTO TABLE HEIGHT) ==================
-# We store viewport height in session state, updated by a small JS snippet.
-if "viewport_h" not in st.session_state:
-    st.session_state.viewport_h = 900  # safe default
-
-components.html(
-    """
-<script>
-(function() {
-  const h = window.innerHeight || 900;
-  const msg = {isStreamlitMessage: true, type: "VIEWPORT_HEIGHT", height: h};
-  window.parent.postMessage(msg, "*");
-})();
-</script>
 """,
-    height=0,
+    unsafe_allow_html=True,
 )
-
-# Streamlit listens for postMessage via st.experimental_get_query_params? No.
-# So we emulate it by using a hidden text input fed by query params? Not possible.
-# Instead: we provide a manual fallback slider in sidebar, and compute heights off it.
-
-# Sidebar "screen height" override (because Streamlit can't reliably receive JS postMessage)
-st.sidebar.markdown("### Affichage")
-st.session_state.viewport_h = st.sidebar.slider(
-    "Hauteur écran (px) (ajuste pour éviter le scroll)",
-    min_value=650,
-    max_value=1400,
-    value=int(st.session_state.viewport_h),
-    step=25,
-    key="vh_slider",
-)
-st.sidebar.caption("Ajuste une fois par ordinateur, après ça tu ne touches plus.")
-
-
-def editor_height():
-    """
-    Compute a table height that fits comfortably on screen.
-    We assume:
-    - header + controls consume ~320px on each tab
-    - leave a small margin
-    """
-    h = int(st.session_state.viewport_h)
-    return max(380, min(820, h - 320))
-
-
-# ================== AUTH ==================
-if "auth" not in st.session_state:
-    st.session_state.auth = False
-
-if not st.session_state.auth:
-    st.title("Accès protégé")
-    pwd = st.text_input("Mot de passe", type="password", key="pwd")
-    app_password = st.secrets.get("APP_PASSWORD")
-    if st.button("Se connecter", key="btn_login"):
-        if not app_password:
-            st.error("APP_PASSWORD manquant dans Streamlit secrets.")
-            st.stop()
-        if pwd == app_password:
-            st.session_state.auth = True
-            st.rerun()
-        else:
-            st.error("Mot de passe incorrect.")
-    st.stop()
 
 
 # ================== DENOMS ==================
@@ -143,7 +75,6 @@ DENOMS = {
     "Rouleau 0,10 $ (50) — 5 $": 500,
     "Rouleau 0,05 $ (40) — 2 $": 200,
 }
-
 BILLS_BIG = ["Billet 100 $", "Billet 50 $", "Billet 20 $"]
 BILLS_SMALL = ["Billet 10 $", "Billet 5 $"]
 COINS = ["Pièce 2 $", "Pièce 1 $", "Pièce 0,25 $", "Pièce 0,10 $", "Pièce 0,05 $"]
@@ -158,9 +89,18 @@ DISPLAY_ORDER = BILLS_BIG + BILLS_SMALL + COINS + ROLLS
 
 
 # ================== HELPERS ==================
-def safe_int(x, default=0) -> int:
+def safe_int(x, default=None):
+    """
+    Gentle int conversion:
+    - returns default if empty or invalid
+    - default=None used to preserve previous values
+    """
     try:
-        if x is None or x == "":
+        if x is None:
+            return default
+        if isinstance(x, float) and pd.isna(x):
+            return default
+        if x == "":
             return default
         return int(x)
     except Exception:
@@ -172,24 +112,24 @@ def cents_to_str(c: int) -> str:
 
 
 def total_cents(counts: dict) -> int:
-    return sum(safe_int(counts.get(k, 0)) * DENOMS[k] for k in DENOMS)
+    return sum(int(counts.get(k, 0)) * DENOMS[k] for k in DENOMS)
 
 
 def add_counts(a: dict, b: dict) -> dict:
-    return {k: safe_int(a.get(k, 0)) + safe_int(b.get(k, 0)) for k in DENOMS}
+    return {k: int(a.get(k, 0)) + int(b.get(k, 0)) for k in DENOMS}
 
 
 def sub_counts(a: dict, b: dict) -> dict:
-    return {k: safe_int(a.get(k, 0)) - safe_int(b.get(k, 0)) for k in DENOMS}
+    return {k: int(a.get(k, 0)) - int(b.get(k, 0)) for k in DENOMS}
 
 
 def clamp_locked(locked: dict, avail: dict) -> dict:
     out = {}
     for k, v in (locked or {}).items():
-        v = safe_int(v, 0)
+        v = int(v)
         if v < 0:
             v = 0
-        mx = safe_int(avail.get(k, 0), 0)
+        mx = int(avail.get(k, 0))
         if v > mx:
             v = mx
         out[k] = v
@@ -203,22 +143,20 @@ def take_greedy(remaining: int, keys: list, avail: dict, out: dict, locked: dict
         if k in locked:
             continue
         v = DENOMS[k]
-        can_take = safe_int(avail.get(k, 0)) - safe_int(out.get(k, 0))
+        can_take = int(avail.get(k, 0)) - int(out.get(k, 0))
         if can_take < 0:
             can_take = 0
         take = min(remaining // v, can_take)
         if take > 0:
-            out[k] = safe_int(out.get(k, 0)) + take
-            remaining -= take * v
+            out[k] = int(out.get(k, 0)) + int(take)
+            remaining -= int(take) * v
     return remaining
 
 
 def suggest_withdrawal(amount_cents: int, allowed: list, avail: dict, locked: dict, priority: list):
     out = {k: 0 for k in DENOMS}
-    locked = locked or {}
-
-    for k, q in locked.items():
-        out[k] = safe_int(q)
+    for k, q in (locked or {}).items():
+        out[k] = int(q)
 
     remaining = amount_cents - total_cents(out)
     if remaining < 0:
@@ -226,7 +164,8 @@ def suggest_withdrawal(amount_cents: int, allowed: list, avail: dict, locked: di
 
     allowed_set = set(allowed)
     prio = [k for k in priority if k in allowed_set]
-    remaining = take_greedy(remaining, prio, avail, out, locked)
+
+    remaining = take_greedy(remaining, prio, avail, out, locked or {})
     return out, remaining
 
 
@@ -235,43 +174,38 @@ def hash_payload(obj: dict) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
-def list_dates(folder: str):
-    files = sorted([f for f in os.listdir(folder) if f.endswith("_state.json")])
-    return [f.replace("_state.json", "") for f in files]
-
-
-def save_state(folder: str, d: date, payload: dict):
-    p = os.path.join(folder, f"{d.isoformat()}_state.json")
-    with open(p, "w", encoding="utf-8") as f:
+def save_json(path: str, payload: dict):
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
 
-def load_state(folder: str, d: date):
-    p = os.path.join(folder, f"{d.isoformat()}_state.json")
-    if not os.path.exists(p):
+def load_json(path: str):
+    if not os.path.exists(path):
         return None
-    with open(p, "r", encoding="utf-8") as f:
+    with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
-def save_receipt(folder: str, d: date, html: str):
-    p = os.path.join(folder, f"{d.isoformat()}_receipt.html")
-    with open(p, "w", encoding="utf-8") as f:
+def save_receipt(path: str, html: str):
+    with open(path, "w", encoding="utf-8") as f:
         f.write(html)
 
 
-def load_receipt(folder: str, d: date):
-    p = os.path.join(folder, f"{d.isoformat()}_receipt.html")
-    if not os.path.exists(p):
-        return None, None
-    with open(p, "r", encoding="utf-8") as f:
-        return f.read(), p
+def load_text(path: str):
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def list_saved_dates(folder: str):
+    files = sorted([f for f in os.listdir(folder) if f.endswith("_state.json")])
+    return [f.replace("_state.json", "") for f in files]
 
 
 def receipt_html(title: str, meta: dict, headers: list, rows: list) -> str:
     meta_html = "".join([f"<div><b>{k}:</b> {v}</div>" for k, v in meta.items()])
     thead = "".join([f"<th>{h}</th>" for h in headers])
-
     body = ""
     for r in rows:
         tds = []
@@ -310,104 +244,122 @@ def receipt_html(title: str, meta: dict, headers: list, rows: list) -> str:
     """
 
 
-# ================== DEFAULT TABLES ==================
+# ================== DATAFRAME BUILDERS ==================
+CAISSE_COLS = ["Dénomination", "OPEN", "CLOSE", "RETRAIT", "RESTANT"]
+BOITE_COLS = ["Dénomination", "Boîte (avant)", "Dépôt", "Change retiré", "Boîte (après)"]
+
+
 def df_caisse_default():
-    return pd.DataFrame([{"Dénomination": k, "OPEN": 0, "CLOSE": 0, "RETRAIT": 0, "RESTANT": 0} for k in DISPLAY_ORDER])
+    return pd.DataFrame([{ "Dénomination": k, "OPEN": 0, "CLOSE": 0, "RETRAIT": 0, "RESTANT": 0 } for k in DISPLAY_ORDER])
 
 
 def df_boite_default():
-    return pd.DataFrame([{
-        "Dénomination": k,
-        "Boîte (avant)": 0,
-        "Dépôt": 0,
-        "Change retiré": 0,
-        "Boîte (après)": 0
-    } for k in DISPLAY_ORDER])
+    return pd.DataFrame([{ "Dénomination": k, "Boîte (avant)": 0, "Dépôt": 0, "Change retiré": 0, "Boîte (après)": 0 } for k in DISPLAY_ORDER])
 
 
-# ================== NORMALISATION ==================
-def normalize_caisse_df_load(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-        return df_caisse_default()
-    df = df.copy()
-    if "Dénomination" not in df.columns:
-        return df_caisse_default()
-    for col in ["OPEN", "CLOSE", "RETRAIT", "RESTANT"]:
-        if col not in df.columns:
-            df[col] = 0
-    df = df[["Dénomination", "OPEN", "CLOSE", "RETRAIT", "RESTANT"]]
-    df["Dénomination"] = df["Dénomination"].astype(str)
-    df = df.set_index("Dénomination").reindex(DISPLAY_ORDER).fillna(0).reset_index()
-    for col in ["OPEN", "CLOSE", "RETRAIT", "RESTANT"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+def gentle_coerce_editable(df_out: pd.DataFrame, df_prev: pd.DataFrame, editable_cols: list):
+    """
+    Key fix: preserve user edits.
+    If user typed blank/invalid and hit Enter, we keep previous value instead of forcing 0.
+    """
+    df = df_out.copy()
+    prev = df_prev.copy()
+
+    # Ensure denom alignment (never reindex during edit)
+    if "Dénomination" not in df.columns or "Dénomination" not in prev.columns:
+        return df
+
+    denom_to_prev = {r["Dénomination"]: r for _, r in prev.iterrows()}
+
+    for idx, row in df.iterrows():
+        d = row["Dénomination"]
+        prev_row = denom_to_prev.get(d, {})
+        for col in editable_cols:
+            new_v = safe_int(row.get(col), default=None)
+            if new_v is None:
+                df.at[idx, col] = int(prev_row.get(col, 0))
+            else:
+                df.at[idx, col] = int(new_v)
+
     return df
 
 
-def normalize_boite_df_load(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-        return df_boite_default()
-    df = df.copy()
-    if "Dépôt" not in df.columns and "Dépôt billets" in df.columns:
-        df.rename(columns={"Dépôt billets": "Dépôt"}, inplace=True)
-    if "Dénomination" not in df.columns:
-        return df_boite_default()
-    for col in ["Boîte (avant)", "Dépôt", "Change retiré", "Boîte (après)"]:
-        if col not in df.columns:
-            df[col] = 0
-    df = df[["Dénomination", "Boîte (avant)", "Dépôt", "Change retiré", "Boîte (après)"]]
-    df["Dénomination"] = df["Dénomination"].astype(str)
-    df = df.set_index("Dénomination").reindex(DISPLAY_ORDER).fillna(0).reset_index()
-    for col in ["Boîte (avant)", "Dépôt", "Change retiré", "Boîte (après)"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
-    return df
+# ================== SAVING HELPERS ==================
+def caisse_paths(d: date):
+    ds = d.isoformat()
+    return (
+        os.path.join(DIR_CAISSE, f"{ds}_state.json"),
+        os.path.join(DIR_CAISSE, f"{ds}_receipt.html"),
+    )
+
+def boite_paths(d: date):
+    ds = d.isoformat()
+    return (
+        os.path.join(DIR_BOITE, f"{ds}_state.json"),
+        os.path.join(DIR_BOITE, f"{ds}_receipt.html"),
+    )
 
 
-def normalize_caisse_df_live(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-        return df_caisse_default()
-    df = df.copy()
-    if "Dénomination" not in df.columns:
-        return df_caisse_default()
-    for col in ["OPEN", "CLOSE", "RETRAIT", "RESTANT"]:
-        if col not in df.columns:
-            df[col] = 0
-    for col in ["OPEN", "CLOSE", "RETRAIT", "RESTANT"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
-    df["Dénomination"] = df["Dénomination"].astype(str)
-    return df
+# ================== AUTH ==================
+if "auth" not in st.session_state:
+    st.session_state.auth = False
+
+if not st.session_state.auth:
+    st.title("Accès protégé")
+    pwd = st.text_input("Mot de passe", type="password", key="pwd")
+    if st.button("Se connecter", key="login_btn"):
+        if pwd == st.secrets.get("APP_PASSWORD"):
+            st.session_state.auth = True
+            st.rerun()
+        else:
+            st.error("Mot de passe incorrect.")
+    st.stop()
 
 
-def normalize_boite_df_live(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-        return df_boite_default()
-    df = df.copy()
-    if "Dépôt" not in df.columns and "Dépôt billets" in df.columns:
-        df.rename(columns={"Dépôt billets": "Dépôt"}, inplace=True)
-    if "Dénomination" not in df.columns:
-        return df_boite_default()
-    for col in ["Boîte (avant)", "Dépôt", "Change retiré", "Boîte (après)"]:
-        if col not in df.columns:
-            df[col] = 0
-    for col in ["Boîte (avant)", "Dépôt", "Change retiré", "Boîte (après)"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
-    df["Dénomination"] = df["Dénomination"].astype(str)
-    return df
+# ================== MODE PICKER ==================
+today = datetime.now(TZ).date()
+yesterday = today - timedelta(days=1)
+
+if "mode_pick" not in st.session_state:
+    st.session_state.mode_pick = None  # "normal" or "missed_close"
+if "mode_done_today" not in st.session_state:
+    st.session_state.mode_done_today = None  # store date string so it doesn't ask again today
+
+if st.session_state.mode_done_today != today.isoformat():
+    st.session_state.mode_pick = None
+
+if st.session_state.mode_pick is None:
+    st.title("Choix d'ouverture")
+    st.caption("Sélectionne le scénario d'aujourd'hui.")
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("✅ Ouverture normale", use_container_width=True, key="pick_normal"):
+            st.session_state.mode_pick = "normal"
+            st.session_state.mode_done_today = today.isoformat()
+            st.rerun()
+    with c2:
+        if st.button("⚠️ Ouverture non effectuée (hier)", use_container_width=True, key="pick_missed"):
+            st.session_state.mode_pick = "missed_close"
+            st.session_state.mode_done_today = today.isoformat()
+            st.rerun()
+    st.stop()
 
 
 # ================== STATE INIT ==================
-today = datetime.now(TZ).date()
-
 def ensure_state():
     defaults = {
-        "booted_for": None,
         "cashier": "",
         "register_no": 1,
         "target_dollars": 200,
-        "df_caisse": df_caisse_default(),
-        "df_boite": df_boite_default(),
+
+        "df_caisse_today": df_caisse_default(),
+        "df_caisse_yesterday": df_caisse_default(),  # used only in missed_close mode (as CLOSE hier)
         "locked_retrait_caisse": {},
+
+        "df_boite": df_boite_default(),
         "locked_withdraw_boite": {},
         "boite_allowed": set(["Billet 20 $", "Billet 10 $", "Billet 5 $"] + COINS + ROLLS),
+
         "last_hash_caisse": None,
         "last_hash_boite": None,
     }
@@ -417,56 +369,60 @@ def ensure_state():
 
 ensure_state()
 
-if st.session_state.booted_for != today:
-    st.session_state.booted_for = today
 
-    sc = load_state(DIR_CAISSE, today)
-    if sc:
-        st.session_state.cashier = sc.get("meta", {}).get("Caissier(ère)", st.session_state.cashier)
-        st.session_state.register_no = safe_int(sc.get("meta", {}).get("Caisse #", st.session_state.register_no), 1)
-        st.session_state.target_dollars = safe_int(sc.get("meta", {}).get("Cible $", st.session_state.target_dollars), 200)
-        table = sc.get("register", {}).get("table")
-        if isinstance(table, list) and table:
-            st.session_state.df_caisse = normalize_caisse_df_load(pd.DataFrame(table))
-        st.session_state.locked_retrait_caisse = sc.get("register", {}).get("locked_retrait", {}) or {}
+# ================== LOAD TODAY SAVES ==================
+# (Load once per day)
+if "booted_for" not in st.session_state:
+    st.session_state.booted_for = None
 
-    sb = load_state(DIR_BOITE, today)
-    if sb:
-        st.session_state.cashier = sb.get("meta", {}).get("Caissier(ère)", st.session_state.cashier)
-        table = sb.get("boite", {}).get("table")
-        if isinstance(table, list) and table:
-            st.session_state.df_boite = normalize_boite_df_load(pd.DataFrame(table))
-        st.session_state.locked_withdraw_boite = sb.get("boite", {}).get("locked_withdraw", {}) or {}
-        allowed = sb.get("boite", {}).get("allowed_denoms")
+if st.session_state.booted_for != today.isoformat():
+    st.session_state.booted_for = today.isoformat()
+
+    state_path_c, _ = caisse_paths(today)
+    saved_c = load_json(state_path_c)
+    if saved_c:
+        st.session_state.cashier = saved_c.get("meta", {}).get("Caissier(ère)", st.session_state.cashier)
+        st.session_state.register_no = int(saved_c.get("meta", {}).get("Caisse #", st.session_state.register_no))
+        st.session_state.target_dollars = int(saved_c.get("meta", {}).get("Cible $", st.session_state.target_dollars))
+        tbl = saved_c.get("register", {}).get("table_today", None)
+        if isinstance(tbl, list) and tbl:
+            df = pd.DataFrame(tbl)
+            st.session_state.df_caisse_today = df[CAISSE_COLS].copy()
+        st.session_state.locked_retrait_caisse = saved_c.get("register", {}).get("locked_retrait", {}) or {}
+
+        # If missed mode, we may have yesterday table saved too
+        tbl_y = saved_c.get("register", {}).get("table_yesterday", None)
+        if isinstance(tbl_y, list) and tbl_y:
+            dfy = pd.DataFrame(tbl_y)
+            st.session_state.df_caisse_yesterday = dfy[CAISSE_COLS].copy()
+
+    state_path_b, _ = boite_paths(today)
+    saved_b = load_json(state_path_b)
+    if saved_b:
+        tbl = saved_b.get("boite", {}).get("table", None)
+        if isinstance(tbl, list) and tbl:
+            df = pd.DataFrame(tbl)
+            st.session_state.df_boite = df[BOITE_COLS].copy()
+        st.session_state.locked_withdraw_boite = saved_b.get("boite", {}).get("locked_withdraw", {}) or {}
+        allowed = saved_b.get("boite", {}).get("allowed_denoms")
         if isinstance(allowed, list) and allowed:
             st.session_state.boite_allowed = set(allowed)
-
-st.session_state.df_caisse = normalize_caisse_df_live(st.session_state.df_caisse)
-st.session_state.df_boite = normalize_boite_df_live(st.session_state.df_boite)
 
 
 # ================== HEADER ==================
 st.title("Registre — Caisse & Boîte de monnaie")
 
-h1, h2, h3, h4, h5 = st.columns([1.2, 1.0, 1.2, 1.8, 2.0])
+h1, h2, h3, h4 = st.columns([1.1, 1.0, 1.2, 2.0])
 with h1:
     st.write("**Date:**", today.isoformat())
 with h2:
     st.write("**Heure:**", datetime.now(TZ).strftime("%H:%M"))
 with h3:
-    st.session_state.register_no = st.selectbox(
-        "Caisse #", [1, 2, 3],
-        index=[1, 2, 3].index(st.session_state.register_no),
-        key="sel_register",
-    )
+    st.session_state.register_no = st.selectbox("Caisse #", [1, 2, 3], index=[1,2,3].index(st.session_state.register_no), key="reg_sel")
 with h4:
-    st.session_state.cashier = st.text_input("Caissier(ère)", value=st.session_state.cashier, key="txt_cashier")
-with h5:
-    st.session_state.target_dollars = st.number_input(
-        "Cible à laisser ($)", min_value=0, step=10,
-        value=int(st.session_state.target_dollars),
-        key="num_target",
-    )
+    st.session_state.cashier = st.text_input("Caissier(ère)", value=st.session_state.cashier, key="cashier_txt")
+
+st.session_state.target_dollars = st.number_input("Cible à laisser ($)", min_value=0, step=10, value=int(st.session_state.target_dollars), key="target_num")
 
 st.divider()
 tab_caisse, tab_boite, tab_save = st.tabs(["1) Caisse", "2) Boîte (Échange)", "3) Sauvegarde & reçus"])
@@ -474,13 +430,138 @@ tab_caisse, tab_boite, tab_save = st.tabs(["1) Caisse", "2) Boîte (Échange)", 
 
 # ================== TAB: CAISSE ==================
 with tab_caisse:
-    st.subheader("Caisse — OPEN/CLOSE + RETRAIT + RESTANT (même tableau)")
+    TARGET = int(st.session_state.target_dollars) * 100
 
+    # PRIORITY (caisse): favour big bills to reach target
+    coins_desc = sorted(COINS, key=lambda x: DENOMS[x], reverse=True)
+    rolls_desc = sorted(ROLLS, key=lambda x: DENOMS[x], reverse=True)
+    PRIORITY_CAISSE = BILLS_BIG + BILLS_SMALL + coins_desc + rolls_desc
+
+    st.subheader("Caisse")
+
+    # If missed close mode: show yesterday CLOSE input first
+    if st.session_state.mode_pick == "missed_close":
+        st.markdown("### ⚠️ Hier — fermeture non effectuée")
+        st.caption("Entre le comptage de fin de journée d'hier (CLOSE). L'app calcule le retrait et prépare l'OPEN d'aujourd'hui.")
+
+        prev_y = st.session_state.df_caisse_yesterday.copy()
+        edited_y = st.data_editor(
+            st.session_state.df_caisse_yesterday,
+            hide_index=True,
+            use_container_width=True,
+            height=520,
+            column_config={
+                "Dénomination": st.column_config.TextColumn(disabled=True),
+                "OPEN": st.column_config.NumberColumn(disabled=True),
+                "CLOSE": st.column_config.NumberColumn(min_value=0, step=1),
+                "RETRAIT": st.column_config.NumberColumn(disabled=True),
+                "RESTANT": st.column_config.NumberColumn(disabled=True),
+            },
+            key="ed_caisse_yesterday",
+        )
+
+        # Gentle coerce ONLY CLOSE (editable) to prevent reset bug
+        edited_y = gentle_coerce_editable(edited_y, prev_y, editable_cols=["CLOSE"])
+        st.session_state.df_caisse_yesterday = edited_y
+
+        close_y = {r["Dénomination"]: int(r["CLOSE"]) for _, r in st.session_state.df_caisse_yesterday.iterrows()}
+        total_close_y = total_cents(close_y)
+        diff_y = total_close_y - TARGET
+
+        retrait_y = {k: 0 for k in DENOMS}
+        restant_y = dict(close_y)
+        remaining_y = 0
+
+        if diff_y > 0:
+            st.session_state.locked_retrait_caisse = clamp_locked(st.session_state.locked_retrait_caisse, close_y)
+            retrait_y, remaining_y = suggest_withdrawal(
+                diff_y,
+                allowed=DISPLAY_ORDER,
+                avail=close_y,
+                locked=dict(st.session_state.locked_retrait_caisse),
+                priority=PRIORITY_CAISSE,
+            )
+            restant_y = sub_counts(close_y, retrait_y)
+
+        # Write computed columns without touching CLOSE
+        dfy = st.session_state.df_caisse_yesterday.copy()
+        dfy["RETRAIT"] = dfy["Dénomination"].map(lambda k: int(retrait_y.get(k, 0)))
+        dfy["RESTANT"] = dfy["Dénomination"].map(lambda k: int(restant_y.get(k, 0)))
+        st.session_state.df_caisse_yesterday = dfy
+
+        # Totals under columns (yesterday)
+        f1, f2, f3, f4 = st.columns(4)
+        with f1:
+            st.markdown("<div class='totals-label'>TOTAL OPEN (hier)</div><div class='totals-box'>—</div>", unsafe_allow_html=True)
+        with f2:
+            st.markdown(f"<div class='totals-label'>TOTAL CLOSE (hier)</div><div class='totals-box'>{cents_to_str(total_close_y)}</div>", unsafe_allow_html=True)
+        with f3:
+            st.markdown(f"<div class='totals-label'>À retirer (hier)</div><div class='totals-box'>{cents_to_str(diff_y)}</div>", unsafe_allow_html=True)
+        with f4:
+            st.markdown(f"<div class='totals-label'>TOTAL RESTANT (hier)</div><div class='totals-box'>{cents_to_str(total_cents(restant_y))}</div>", unsafe_allow_html=True)
+
+        st.divider()
+        st.markdown("### Ajuster RETRAIT (hier) (➖/➕)")
+
+        if diff_y <= 0:
+            st.warning("Hier: sous la cible (ou égal). Aucun retrait.")
+        else:
+            if remaining_y == 0:
+                st.success("Retrait hier proposé: " + cents_to_str(total_cents(retrait_y)))
+            elif remaining_y < 0:
+                st.warning("Verrouillage trop haut. Dépasse de " + cents_to_str(-remaining_y))
+            else:
+                st.warning("Impossible exact. Reste: " + cents_to_str(remaining_y))
+
+            r0, r1 = st.columns([1.3, 3.7])
+            with r0:
+                if st.button("Reset ajustements retrait (hier)", key="btn_reset_y"):
+                    st.session_state.locked_retrait_caisse = {}
+                    st.rerun()
+            with r1:
+                st.caption("➖/➕ verrouille la dénomination et recalcule le reste.")
+
+            for k in DISPLAY_ORDER:
+                mx = int(close_y.get(k, 0))
+                q = int(retrait_y.get(k, 0))
+                c0, c1, c2, c3, c4 = st.columns([2.6, 0.7, 1.0, 0.7, 1.0], vertical_alignment="center")
+                c0.markdown(f"**{k}**")
+                minus = c1.button("➖", key=f"y_minus_{k}")
+                c2.markdown(f"**{q}**")
+                plus = c3.button("➕", key=f"y_plus_{k}")
+                c4.caption(f"Dispo: {mx}")
+                if minus or plus:
+                    new_locked = dict(st.session_state.locked_retrait_caisse)
+                    if k not in new_locked:
+                        new_locked[k] = q
+                    if minus:
+                        new_locked[k] = max(0, int(new_locked[k]) - 1)
+                    if plus:
+                        new_locked[k] = min(mx, int(new_locked[k]) + 1)
+                    st.session_state.locked_retrait_caisse = new_locked
+                    st.rerun()
+
+        # OPEN today should be yesterday restant
+        # We populate today's OPEN column with restant_y, but do NOT touch today's CLOSE if already entered
+        df_today = st.session_state.df_caisse_today.copy()
+        denom_to_close_today = {r["Dénomination"]: r.get("CLOSE", 0) for _, r in df_today.iterrows()}
+        df_today["OPEN"] = df_today["Dénomination"].map(lambda k: int(restant_y.get(k, 0)))
+        df_today["CLOSE"] = df_today["Dénomination"].map(lambda k: int(safe_int(denom_to_close_today.get(k, 0), default=0) or 0))
+        st.session_state.df_caisse_today = df_today
+
+        st.divider()
+        st.markdown("### ✅ Aujourd'hui — OPEN pré-rempli (RESTANT d'hier), entre le CLOSE d'aujourd'hui")
+
+    else:
+        st.caption("Ouverture normale: entre OPEN (matin) et CLOSE (fin de journée). L'app propose le retrait pour revenir à la cible.")
+
+    # ===== Today table =====
+    prev_today = st.session_state.df_caisse_today.copy()
     edited = st.data_editor(
-        st.session_state.df_caisse,
+        st.session_state.df_caisse_today,
         hide_index=True,
         use_container_width=True,
-        height=editor_height(),
+        height=520,
         column_config={
             "Dénomination": st.column_config.TextColumn(disabled=True),
             "OPEN": st.column_config.NumberColumn(min_value=0, step=1),
@@ -488,104 +569,109 @@ with tab_caisse:
             "RETRAIT": st.column_config.NumberColumn(disabled=True),
             "RESTANT": st.column_config.NumberColumn(disabled=True),
         },
-        key="ed_caisse",
+        key="ed_caisse_today",
     )
-    st.session_state.df_caisse = normalize_caisse_df_live(edited)
 
-    open_counts = {r["Dénomination"]: safe_int(r["OPEN"]) for _, r in st.session_state.df_caisse.iterrows()}
-    close_counts = {r["Dénomination"]: safe_int(r["CLOSE"]) for _, r in st.session_state.df_caisse.iterrows()}
+    # Gentle coerce OPEN/CLOSE only (preserve user input instead of zeroing)
+    edited = gentle_coerce_editable(edited, prev_today, editable_cols=["OPEN", "CLOSE"])
+    st.session_state.df_caisse_today = edited
 
-    total_open = total_cents(open_counts)
-    total_close = total_cents(close_counts)
-    TARGET = int(st.session_state.target_dollars) * 100
-    diff = total_close - TARGET
+    open_today = {r["Dénomination"]: int(r["OPEN"]) for _, r in st.session_state.df_caisse_today.iterrows()}
+    close_today = {r["Dénomination"]: int(r["CLOSE"]) for _, r in st.session_state.df_caisse_today.iterrows()}
 
-    a, b, c = st.columns(3)
-    a.info("TOTAL OPEN: " + cents_to_str(total_open))
-    b.success("TOTAL CLOSE: " + cents_to_str(total_close))
-    c.write("**À retirer:** " + f"**{cents_to_str(diff)}**")
+    total_open_today = total_cents(open_today)
+    total_close_today = total_cents(close_today)
+    diff_today = total_close_today - TARGET
 
-    retrait = {k: 0 for k in DENOMS}
-    restant = dict(close_counts)
-    remaining = 0
+    retrait_today = {k: 0 for k in DENOMS}
+    restant_today = dict(close_today)
+    remaining_today = 0
 
-    if diff > 0:
-        coins_desc = sorted(COINS, key=lambda x: DENOMS[x], reverse=True)
-        rolls_desc = sorted(ROLLS, key=lambda x: DENOMS[x], reverse=True)
-        priority_caisse = BILLS_BIG + BILLS_SMALL + coins_desc + rolls_desc
-
-        st.session_state.locked_retrait_caisse = clamp_locked(st.session_state.locked_retrait_caisse, close_counts)
-        retrait, remaining = suggest_withdrawal(
-            diff,
+    if diff_today > 0:
+        st.session_state.locked_retrait_caisse = clamp_locked(st.session_state.locked_retrait_caisse, close_today)
+        retrait_today, remaining_today = suggest_withdrawal(
+            diff_today,
             allowed=DISPLAY_ORDER,
-            avail=close_counts,
+            avail=close_today,
             locked=dict(st.session_state.locked_retrait_caisse),
-            priority=priority_caisse,
+            priority=PRIORITY_CAISSE,
         )
-        restant = sub_counts(close_counts, retrait)
+        restant_today = sub_counts(close_today, retrait_today)
 
-    df = st.session_state.df_caisse.copy()
-    df["RETRAIT"] = df["Dénomination"].map(lambda k: safe_int(retrait.get(k, 0)))
-    df["RESTANT"] = df["Dénomination"].map(lambda k: safe_int(restant.get(k, 0)))
-    st.session_state.df_caisse = normalize_caisse_df_live(df)
+    # Update computed cols only
+    df_t = st.session_state.df_caisse_today.copy()
+    df_t["RETRAIT"] = df_t["Dénomination"].map(lambda k: int(retrait_today.get(k, 0)))
+    df_t["RESTANT"] = df_t["Dénomination"].map(lambda k: int(restant_today.get(k, 0)))
+    st.session_state.df_caisse_today = df_t
+
+    # Totals under columns (TODAY)
+    f1, f2, f3, f4 = st.columns(4)
+    with f1:
+        st.markdown(f"<div class='totals-label'>TOTAL OPEN</div><div class='totals-box'>{cents_to_str(total_open_today)}</div>", unsafe_allow_html=True)
+    with f2:
+        st.markdown(f"<div class='totals-label'>TOTAL CLOSE</div><div class='totals-box'>{cents_to_str(total_close_today)}</div>", unsafe_allow_html=True)
+    with f3:
+        st.markdown(f"<div class='totals-label'>À retirer</div><div class='totals-box'>{cents_to_str(diff_today)}</div>", unsafe_allow_html=True)
+    with f4:
+        st.markdown(f"<div class='totals-label'>TOTAL RESTANT</div><div class='totals-box'>{cents_to_str(total_cents(restant_today))}</div>", unsafe_allow_html=True)
 
     st.divider()
-    st.subheader("Ajuster RETRAIT (➖/➕) — aligné sur les lignes")
+    st.subheader("Ajuster RETRAIT (aujourd'hui) (➖/➕)")
 
-    if diff <= 0:
+    if diff_today <= 0:
         st.warning("Sous la cible (ou égal). Aucun retrait nécessaire.")
     else:
-        if remaining == 0:
-            st.success("Retrait proposé: " + cents_to_str(total_cents(retrait)))
-        elif remaining < 0:
-            st.warning("Verrouillage trop haut. Dépasse de " + cents_to_str(-remaining))
+        if remaining_today == 0:
+            st.success("Retrait proposé: " + cents_to_str(total_cents(retrait_today)))
+        elif remaining_today < 0:
+            st.warning("Verrouillage trop haut. Dépasse de " + cents_to_str(-remaining_today))
         else:
-            st.warning("Impossible exact. Reste: " + cents_to_str(remaining))
+            st.warning("Impossible exact. Reste: " + cents_to_str(remaining_today))
 
         r0, r1 = st.columns([1.3, 3.7])
         with r0:
-            if st.button("Reset ajustements retrait", key="btn_reset_caisse_locks"):
+            if st.button("Reset ajustements retrait (aujourd'hui)", key="btn_reset_today"):
                 st.session_state.locked_retrait_caisse = {}
                 st.rerun()
         with r1:
-            st.caption("Chaque ➖/➕ verrouille la dénomination et recalcule le reste automatiquement.")
+            st.caption("➖/➕ verrouille la dénomination et recalcule le reste.")
 
         for k in DISPLAY_ORDER:
-            mx = safe_int(close_counts.get(k, 0))
-            q = safe_int(retrait.get(k, 0))
+            mx = int(close_today.get(k, 0))
+            q = int(retrait_today.get(k, 0))
             c0, c1, c2, c3, c4 = st.columns([2.6, 0.7, 1.0, 0.7, 1.0], vertical_alignment="center")
             c0.markdown(f"**{k}**")
-            minus = c1.button("➖", key=f"caisse_minus_inline_{k}")
+            minus = c1.button("➖", key=f"t_minus_{k}")
             c2.markdown(f"**{q}**")
-            plus = c3.button("➕", key=f"caisse_plus_inline_{k}")
+            plus = c3.button("➕", key=f"t_plus_{k}")
             c4.caption(f"Dispo: {mx}")
             if minus or plus:
                 new_locked = dict(st.session_state.locked_retrait_caisse)
                 if k not in new_locked:
                     new_locked[k] = q
                 if minus:
-                    new_locked[k] = max(0, safe_int(new_locked[k]) - 1)
+                    new_locked[k] = max(0, int(new_locked[k]) - 1)
                 if plus:
-                    new_locked[k] = min(mx, safe_int(new_locked[k]) + 1)
+                    new_locked[k] = min(mx, int(new_locked[k]) + 1)
                 st.session_state.locked_retrait_caisse = new_locked
                 st.rerun()
 
-    # Receipt rows
-    rows_caisse = []
+    # Receipt rows (today)
+    rows_today = []
     for k in DISPLAY_ORDER:
-        rows_caisse.append({
+        rows_today.append({
             "Dénomination": k,
-            "OPEN": safe_int(open_counts.get(k, 0)),
-            "CLOSE": safe_int(close_counts.get(k, 0)),
-            "RETRAIT": safe_int(retrait.get(k, 0)),
-            "RESTANT": safe_int(restant.get(k, 0)),
+            "OPEN": int(open_today.get(k, 0)),
+            "CLOSE": int(close_today.get(k, 0)),
+            "RETRAIT": int(retrait_today.get(k, 0)),
+            "RESTANT": int(restant_today.get(k, 0)),
         })
-    rows_caisse.append({
+    rows_today.append({
         "Dénomination": "TOTAL ($)",
-        "OPEN": f"{total_open/100:.2f}",
-        "CLOSE": f"{total_close/100:.2f}",
-        "RETRAIT": f"{total_cents(retrait)/100:.2f}",
-        "RESTANT": f"{total_cents(restant)/100:.2f}",
+        "OPEN": f"{total_open_today/100:.2f}",
+        "CLOSE": f"{total_close_today/100:.2f}",
+        "RETRAIT": f"{total_cents(retrait_today)/100:.2f}",
+        "RESTANT": f"{total_cents(restant_today)/100:.2f}",
     })
 
     meta_caisse = {
@@ -595,35 +681,34 @@ with tab_caisse:
         "Caisse #": int(st.session_state.register_no),
         "Caissier(ère)": (st.session_state.cashier.strip() or "—"),
         "Cible $": int(st.session_state.target_dollars),
+        "Mode": "Ouverture non effectuée" if st.session_state.mode_pick == "missed_close" else "Ouverture normale",
     }
 
     payload_caisse = {
         "meta": meta_caisse,
         "register": {
-            "table": st.session_state.df_caisse.to_dict("records"),
+            "table_today": st.session_state.df_caisse_today.to_dict("records"),
+            "table_yesterday": st.session_state.df_caisse_yesterday.to_dict("records") if st.session_state.mode_pick == "missed_close" else None,
             "locked_retrait": st.session_state.locked_retrait_caisse,
-            "rows": rows_caisse,
+            "rows_today": rows_today,
         },
     }
 
+    state_path, receipt_path = caisse_paths(today)
     hc = hash_payload(payload_caisse)
     if st.session_state.last_hash_caisse != hc:
-        html = receipt_html("Reçu — Caisse", meta_caisse, ["Dénomination", "OPEN", "CLOSE", "RETRAIT", "RESTANT"], rows_caisse)
-        save_state(DIR_CAISSE, today, payload_caisse)
-        save_receipt(DIR_CAISSE, today, html)
+        html = receipt_html("Reçu — Caisse", meta_caisse, ["Dénomination", "OPEN", "CLOSE", "RETRAIT", "RESTANT"], rows_today)
+        save_json(state_path, payload_caisse)
+        save_receipt(receipt_path, html)
         st.session_state.last_hash_caisse = hc
 
-    st.markdown("### Aperçu reçu — Caisse")
-    components.html(
-        receipt_html("Reçu — Caisse", meta_caisse, ["Dénomination", "OPEN", "CLOSE", "RETRAIT", "RESTANT"], rows_caisse),
-        height=620,
-        scrolling=True,
-    )
+    st.markdown("### Aperçu reçu — Caisse (aujourd'hui)")
+    components.html(load_text(receipt_path) or html, height=640, scrolling=True)
 
 
 # ================== TAB: BOÎTE ==================
 with tab_boite:
-    st.subheader("Boîte (Échange) — Boîte (avant) + Dépôt + Change retiré + Boîte (après) (même tableau)")
+    st.subheader("Boîte (Échange)")
 
     with st.expander("⚙️ Types autorisés pour le change", expanded=True):
         allowed = set(st.session_state.boite_allowed)
@@ -640,11 +725,12 @@ with tab_boite:
             st.warning("Choisis au moins un type autorisé.")
         st.session_state.boite_allowed = allowed
 
+    prev_b = st.session_state.df_boite.copy()
     edited_b = st.data_editor(
         st.session_state.df_boite,
         hide_index=True,
         use_container_width=True,
-        height=editor_height(),
+        height=520,
         column_config={
             "Dénomination": st.column_config.TextColumn(disabled=True),
             "Boîte (avant)": st.column_config.NumberColumn(min_value=0, step=1),
@@ -654,23 +740,20 @@ with tab_boite:
         },
         key="ed_boite",
     )
-    st.session_state.df_boite = normalize_boite_df_live(edited_b)
 
-    dfb = st.session_state.df_boite
-    box_before = {r["Dénomination"]: safe_int(r["Boîte (avant)"]) for _, r in dfb.iterrows()}
-    deposit = {r["Dénomination"]: safe_int(r["Dépôt"]) for _, r in dfb.iterrows()}
+    # Gentle coerce ONLY editable cols
+    edited_b = gentle_coerce_editable(edited_b, prev_b, editable_cols=["Boîte (avant)", "Dépôt"])
+    st.session_state.df_boite = edited_b
+
+    box_before = {r["Dénomination"]: int(r["Boîte (avant)"]) for _, r in st.session_state.df_boite.iterrows()}
+    deposit = {r["Dénomination"]: int(r["Dépôt"]) for _, r in st.session_state.df_boite.iterrows()}
 
     total_before = total_cents(box_before)
     total_deposit = total_cents(deposit)
 
-    s1, s2, s3 = st.columns(3)
-    s1.info("Boîte (avant): " + cents_to_str(total_before))
-    s2.success("Dépôt total: " + cents_to_str(total_deposit))
-    s3.write("**Change objectif:** " + f"**{cents_to_str(total_deposit)}**")
-
     box_after_deposit = add_counts(box_before, deposit)
 
-    priority_boite = (
+    PRIORITY_BOITE = (
         ["Billet 20 $", "Billet 10 $", "Billet 5 $"]
         + ["Pièce 2 $", "Pièce 1 $", "Pièce 0,25 $", "Pièce 0,10 $", "Pièce 0,05 $"]
         + ROLLS
@@ -688,17 +771,28 @@ with tab_boite:
             allowed=list(st.session_state.boite_allowed),
             avail=box_after_deposit,
             locked=dict(st.session_state.locked_withdraw_boite),
-            priority=priority_boite,
+            priority=PRIORITY_BOITE,
         )
         box_after = sub_counts(box_after_deposit, withdraw)
 
-    df = st.session_state.df_boite.copy()
-    df["Change retiré"] = df["Dénomination"].map(lambda k: safe_int(withdraw.get(k, 0)))
-    df["Boîte (après)"] = df["Dénomination"].map(lambda k: safe_int(box_after.get(k, 0)))
-    st.session_state.df_boite = normalize_boite_df_live(df)
+    dfb = st.session_state.df_boite.copy()
+    dfb["Change retiré"] = dfb["Dénomination"].map(lambda k: int(withdraw.get(k, 0)))
+    dfb["Boîte (après)"] = dfb["Dénomination"].map(lambda k: int(box_after.get(k, 0)))
+    st.session_state.df_boite = dfb
+
+    # Totals under each “column meaning”
+    f1, f2, f3, f4 = st.columns(4)
+    with f1:
+        st.markdown(f"<div class='totals-label'>TOTAL BOÎTE (avant)</div><div class='totals-box'>{cents_to_str(total_before)}</div>", unsafe_allow_html=True)
+    with f2:
+        st.markdown(f"<div class='totals-label'>TOTAL DÉPÔT</div><div class='totals-box'>{cents_to_str(total_deposit)}</div>", unsafe_allow_html=True)
+    with f3:
+        st.markdown(f"<div class='totals-label'>CHANGE À RETIRER</div><div class='totals-box'>{cents_to_str(total_deposit)}</div>", unsafe_allow_html=True)
+    with f4:
+        st.markdown(f"<div class='totals-label'>TOTAL BOÎTE (après)</div><div class='totals-box'>{cents_to_str(total_cents(box_after))}</div>", unsafe_allow_html=True)
 
     st.divider()
-    st.subheader("Ajuster Change retiré (➖/➕) — aligné sur les lignes")
+    st.subheader("Ajuster Change retiré (➖/➕)")
 
     if total_deposit == 0:
         st.warning("Dépôt = 0. Rien à calculer.")
@@ -712,43 +806,40 @@ with tab_boite:
         else:
             st.warning("Impossible exact. Reste: " + cents_to_str(remaining))
 
-        r0, r1 = st.columns([1.3, 3.7])
-        with r0:
-            if st.button("Reset ajustements (boîte)", key="btn_reset_boite_locks"):
-                st.session_state.locked_withdraw_boite = {}
-                st.rerun()
-        with r1:
-            st.caption("Chaque ➖/➕ verrouille la dénomination et recalcule le reste automatiquement.")
+        if st.button("Reset ajustements (boîte)", key="btn_reset_boite"):
+            st.session_state.locked_withdraw_boite = {}
+            st.rerun()
 
         allowed_sorted = [k for k in DISPLAY_ORDER if k in st.session_state.boite_allowed]
         for k in allowed_sorted:
-            mx = safe_int(box_after_deposit.get(k, 0))
-            q = safe_int(withdraw.get(k, 0))
+            mx = int(box_after_deposit.get(k, 0))
+            q = int(withdraw.get(k, 0))
             c0, c1, c2, c3, c4 = st.columns([2.6, 0.7, 1.0, 0.7, 1.0], vertical_alignment="center")
             c0.markdown(f"**{k}**")
-            minus = c1.button("➖", key=f"boite_minus_inline_{k}")
+            minus = c1.button("➖", key=f"b_minus_{k}")
             c2.markdown(f"**{q}**")
-            plus = c3.button("➕", key=f"boite_plus_inline_{k}")
+            plus = c3.button("➕", key=f"b_plus_{k}")
             c4.caption(f"Dispo: {mx}")
             if minus or plus:
                 new_locked = dict(st.session_state.locked_withdraw_boite)
                 if k not in new_locked:
                     new_locked[k] = q
                 if minus:
-                    new_locked[k] = max(0, safe_int(new_locked[k]) - 1)
+                    new_locked[k] = max(0, int(new_locked[k]) - 1)
                 if plus:
-                    new_locked[k] = min(mx, safe_int(new_locked[k]) + 1)
+                    new_locked[k] = min(mx, int(new_locked[k]) + 1)
                 st.session_state.locked_withdraw_boite = new_locked
                 st.rerun()
 
+    # Receipt (boîte)
     rows_boite = []
     for k in DISPLAY_ORDER:
         rows_boite.append({
             "Dénomination": k,
-            "Boîte (avant)": safe_int(box_before.get(k, 0)),
-            "Dépôt": safe_int(deposit.get(k, 0)),
-            "Change retiré": safe_int(withdraw.get(k, 0)),
-            "Boîte (après)": safe_int(box_after.get(k, 0)),
+            "Boîte (avant)": int(box_before.get(k, 0)),
+            "Dépôt": int(deposit.get(k, 0)),
+            "Change retiré": int(withdraw.get(k, 0)),
+            "Boîte (après)": int(box_after.get(k, 0)),
         })
     rows_boite.append({
         "Dénomination": "TOTAL ($)",
@@ -777,80 +868,65 @@ with tab_boite:
         },
     }
 
+    state_path_b, receipt_path_b = boite_paths(today)
     hb = hash_payload(payload_boite)
     if st.session_state.last_hash_boite != hb:
-        html = receipt_html(
-            "Reçu — Boîte (Échange)",
-            meta_boite,
-            ["Dénomination", "Boîte (avant)", "Dépôt", "Change retiré", "Boîte (après)"],
-            rows_boite,
-        )
-        save_state(DIR_BOITE, today, payload_boite)
-        save_receipt(DIR_BOITE, today, html)
+        htmlb = receipt_html("Reçu — Boîte (Échange)", meta_boite, ["Dénomination","Boîte (avant)","Dépôt","Change retiré","Boîte (après)"], rows_boite)
+        save_json(state_path_b, payload_boite)
+        save_receipt(receipt_path_b, htmlb)
         st.session_state.last_hash_boite = hb
 
     st.markdown("### Aperçu reçu — Boîte (Échange)")
-    components.html(
-        receipt_html(
-            "Reçu — Boîte (Échange)",
-            meta_boite,
-            ["Dénomination", "Boîte (avant)", "Dépôt", "Change retiré", "Boîte (après)"],
-            rows_boite,
-        ),
-        height=620,
-        scrolling=True,
-    )
+    components.html(load_text(receipt_path_b) or htmlb, height=640, scrolling=True)
 
 
 # ================== TAB: SAUVEGARDE ==================
 with tab_save:
     st.subheader("Sauvegarde & reçus")
-    st.caption("Liste simple. Caisse et Boîte sont séparés.")
+    st.caption("Clique une date pour voir le reçu détaillé et télécharger les fichiers.")
 
     colA, colB = st.columns(2)
 
     with colA:
         st.markdown("## 📒 Caisse")
-        dates = list_dates(DIR_CAISSE)
+        dates = list_saved_dates(DIR_CAISSE)
         if not dates:
             st.info("Aucun enregistrement Caisse.")
         else:
             for ds in reversed(dates):
                 d = date.fromisoformat(ds)
+                state_path, receipt_path = caisse_paths(d)
                 with st.expander(f"{ds} — Reçu Caisse", expanded=False):
-                    html, _ = load_receipt(DIR_CAISSE, d)
-                    rp = os.path.join(DIR_CAISSE, f"{ds}_receipt.html")
-                    sp = os.path.join(DIR_CAISSE, f"{ds}_state.json")
+                    html = load_text(receipt_path)
                     if html:
-                        components.html(html, height=640, scrolling=True)
+                        components.html(html, height=650, scrolling=True)
                     else:
-                        st.warning("Reçu introuvable pour cette date.")
-                    if os.path.exists(rp):
-                        with open(rp, "rb") as f:
-                            st.download_button("⬇️ Télécharger reçu (HTML)", f.read(), os.path.basename(rp), "text/html", key=f"dl_caisse_html_{ds}")
-                    if os.path.exists(sp):
-                        with open(sp, "rb") as f:
-                            st.download_button("⬇️ Télécharger état (JSON)", f.read(), os.path.basename(sp), "application/json", key=f"dl_caisse_json_{ds}")
+                        st.warning("Reçu introuvable.")
+                    if os.path.exists(receipt_path):
+                        with open(receipt_path, "rb") as f:
+                            st.download_button("⬇️ Télécharger reçu (HTML)", f.read(), os.path.basename(receipt_path), "text/html", key=f"dl_c_html_{ds}")
+                    if os.path.exists(state_path):
+                        with open(state_path, "rb") as f:
+                            st.download_button("⬇️ Télécharger état (JSON)", f.read(), os.path.basename(state_path), "application/json", key=f"dl_c_json_{ds}")
 
     with colB:
         st.markdown("## 🪙 Boîte (Échange)")
-        dates = list_dates(DIR_BOITE)
+        dates = list_saved_dates(DIR_BOITE)
         if not dates:
             st.info("Aucun enregistrement Boîte.")
         else:
             for ds in reversed(dates):
                 d = date.fromisoformat(ds)
+                state_path, receipt_path = boite_paths(d)
                 with st.expander(f"{ds} — Reçu Boîte (Échange)", expanded=False):
-                    html, _ = load_receipt(DIR_BOITE, d)
-                    rp = os.path.join(DIR_BOITE, f"{ds}_receipt.html")
-                    sp = os.path.join(DIR_BOITE, f"{ds}_state.json")
+                    html = load_text(receipt_path)
                     if html:
-                        components.html(html, height=640, scrolling=True)
+                        components.html(html, height=650, scrolling=True)
                     else:
-                        st.warning("Reçu introuvable pour cette date.")
-                    if os.path.exists(rp):
-                        with open(rp, "rb") as f:
-                            st.download_button("⬇️ Télécharger reçu (HTML)", f.read(), os.path.basename(rp), "text/html", key=f"dl_boite_html_{ds}")
-                    if os.path.exists(sp):
-                        with open(sp, "rb") as f:
-                            st.download_button("⬇️ Télécharger état (JSON)", f.read(), os.path.basename(sp), "application/json", key=f"dl_boite_json_{ds}")
+                        st.warning("Reçu introuvable.")
+                    if os.path.exists(receipt_path):
+                        with open(receipt_path, "rb") as f:
+                            st.download_button("⬇️ Télécharger reçu (HTML)", f.read(), os.path.basename(receipt_path), "text/html", key=f"dl_b_html_{ds}")
+                    if os.path.exists(state_path):
+                        with open(state_path, "rb") as f:
+                            st.download_button("⬇️ Télécharger état (JSON)", f.read(), os.path.basename(state_path), "application/json", key=f"dl_b_json_{ds}")
