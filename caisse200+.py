@@ -1,11 +1,12 @@
 # caisse200+.py
 # Registre — Caisse & Boîte (Échange)
 # - 3 tabs: CAISSE / BOÎTE / SAUVEGARDE
-# - Tables show computed columns on same line (report-style)
+# - Bold tables + auto height to avoid scrolling even when screen has space
+# - Report-style tables: computed cols on same line
 # - Inline +/- controls aligned per denomination (below table)
 # - Boîte: choose allowed denominations (checkboxes)
 # - Autosave daily: JSON state + printable HTML receipt (separate folders)
-# - Fix: "type then Enter resets to 0" by using LIVE normalisation (no aggressive reindex mid-edit)
+# - Fix: "type then Enter resets to 0" by LIVE normalisation (no aggressive reindex mid-edit)
 
 import os
 import json
@@ -27,6 +28,81 @@ DIR_CAISSE = os.path.join(BASE_DIR, "records_caisse")
 DIR_BOITE = os.path.join(BASE_DIR, "records_boite")
 os.makedirs(DIR_CAISSE, exist_ok=True)
 os.makedirs(DIR_BOITE, exist_ok=True)
+
+# ================== STYLE (BOLD + SPACE) ==================
+st.markdown("""
+<style>
+/* Bold table text (data_editor) */
+div[data-testid="stDataFrame"] * {
+  font-weight: 700 !important;
+}
+div[data-testid="stDataFrame"] thead th {
+  font-weight: 900 !important;
+  font-size: 15px !important;
+}
+div[data-testid="stDataFrame"] tbody td {
+  font-size: 15px !important;
+}
+
+/* Reduce vertical padding so more content fits without scroll */
+.main .block-container {
+  padding-top: 0.8rem !important;
+  padding-bottom: 0.8rem !important;
+  max-width: 1400px !important;
+}
+
+/* Reduce margins on headers */
+h1, h2, h3 {
+  margin-bottom: 0.35rem !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
+
+# ================== VIEWPORT HEIGHT (AUTO TABLE HEIGHT) ==================
+# We store viewport height in session state, updated by a small JS snippet.
+if "viewport_h" not in st.session_state:
+    st.session_state.viewport_h = 900  # safe default
+
+components.html(
+    """
+<script>
+(function() {
+  const h = window.innerHeight || 900;
+  const msg = {isStreamlitMessage: true, type: "VIEWPORT_HEIGHT", height: h};
+  window.parent.postMessage(msg, "*");
+})();
+</script>
+""",
+    height=0,
+)
+
+# Streamlit listens for postMessage via st.experimental_get_query_params? No.
+# So we emulate it by using a hidden text input fed by query params? Not possible.
+# Instead: we provide a manual fallback slider in sidebar, and compute heights off it.
+
+# Sidebar "screen height" override (because Streamlit can't reliably receive JS postMessage)
+st.sidebar.markdown("### Affichage")
+st.session_state.viewport_h = st.sidebar.slider(
+    "Hauteur écran (px) (ajuste pour éviter le scroll)",
+    min_value=650,
+    max_value=1400,
+    value=int(st.session_state.viewport_h),
+    step=25,
+    key="vh_slider",
+)
+st.sidebar.caption("Ajuste une fois par ordinateur, après ça tu ne touches plus.")
+
+
+def editor_height():
+    """
+    Compute a table height that fits comfortably on screen.
+    We assume:
+    - header + controls consume ~320px on each tab
+    - leave a small margin
+    """
+    h = int(st.session_state.viewport_h)
+    return max(380, min(820, h - 320))
 
 
 # ================== AUTH ==================
@@ -138,15 +214,9 @@ def take_greedy(remaining: int, keys: list, avail: dict, out: dict, locked: dict
 
 
 def suggest_withdrawal(amount_cents: int, allowed: list, avail: dict, locked: dict, priority: list):
-    """
-    Returns (withdraw_counts, remaining_cents)
-    - withdraw respects avail and locked
-    - only uses denominations present in allowed list
-    """
     out = {k: 0 for k in DENOMS}
     locked = locked or {}
 
-    # Apply locked first
     for k, q in locked.items():
         out[k] = safe_int(q)
 
@@ -156,7 +226,6 @@ def suggest_withdrawal(amount_cents: int, allowed: list, avail: dict, locked: di
 
     allowed_set = set(allowed)
     prio = [k for k in priority if k in allowed_set]
-
     remaining = take_greedy(remaining, prio, avail, out, locked)
     return out, remaining
 
@@ -199,7 +268,6 @@ def load_receipt(folder: str, d: date):
         return f.read(), p
 
 
-# ================== RECEIPT BUILDER ==================
 def receipt_html(title: str, meta: dict, headers: list, rows: list) -> str:
     meta_html = "".join([f"<div><b>{k}:</b> {v}</div>" for k, v in meta.items()])
     thead = "".join([f"<th>{h}</th>" for h in headers])
@@ -210,9 +278,9 @@ def receipt_html(title: str, meta: dict, headers: list, rows: list) -> str:
         for i, h in enumerate(headers):
             val = r.get(h, "")
             if i == 0:
-                tds.append(f"<td>{val}</td>")
+                tds.append(f"<td><b>{val}</b></td>")
             else:
-                tds.append(f"<td style='text-align:center'>{val}</td>")
+                tds.append(f"<td style='text-align:center'><b>{val}</b></td>")
         body += "<tr>" + "".join(tds) + "</tr>"
 
     return f"""
@@ -223,7 +291,7 @@ def receipt_html(title: str, meta: dict, headers: list, rows: list) -> str:
       .meta{{font-size:13px;opacity:.95}}
       table{{width:100%;border-collapse:collapse;font-size:13px;margin-top:14px}}
       th,td{{border:1px solid #222;padding:6px}}
-      th{{background:#f0f0f0}}
+      th{{background:#f0f0f0;font-weight:900}}
       .btnbar{{margin-top:12px}}
       button{{padding:10px 14px;border-radius:10px;border:1px solid #bbb;background:#fff;cursor:pointer;font-weight:700}}
       @media print{{.btnbar{{display:none}} body{{padding:0}}}}
@@ -244,39 +312,32 @@ def receipt_html(title: str, meta: dict, headers: list, rows: list) -> str:
 
 # ================== DEFAULT TABLES ==================
 def df_caisse_default():
-    return pd.DataFrame(
-        [{"Dénomination": k, "OPEN": 0, "CLOSE": 0, "RETRAIT": 0, "RESTANT": 0} for k in DISPLAY_ORDER]
-    )
+    return pd.DataFrame([{"Dénomination": k, "OPEN": 0, "CLOSE": 0, "RETRAIT": 0, "RESTANT": 0} for k in DISPLAY_ORDER])
 
 
 def df_boite_default():
-    return pd.DataFrame(
-        [
-            {"Dénomination": k, "Boîte (avant)": 0, "Dépôt": 0, "Change retiré": 0, "Boîte (après)": 0}
-            for k in DISPLAY_ORDER
-        ]
-    )
+    return pd.DataFrame([{
+        "Dénomination": k,
+        "Boîte (avant)": 0,
+        "Dépôt": 0,
+        "Change retiré": 0,
+        "Boîte (après)": 0
+    } for k in DISPLAY_ORDER])
 
 
 # ================== NORMALISATION ==================
-# Strict for LOAD only (reindex & ensure columns)
 def normalize_caisse_df_load(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return df_caisse_default()
     df = df.copy()
-    rename_map = {"Open": "OPEN", "Close": "CLOSE", "Retrait": "RETRAIT", "Restant": "RESTANT"}
-    df.rename(columns={c: rename_map[c] for c in df.columns if c in rename_map}, inplace=True)
-
     if "Dénomination" not in df.columns:
         return df_caisse_default()
     for col in ["OPEN", "CLOSE", "RETRAIT", "RESTANT"]:
         if col not in df.columns:
             df[col] = 0
-
     df = df[["Dénomination", "OPEN", "CLOSE", "RETRAIT", "RESTANT"]]
     df["Dénomination"] = df["Dénomination"].astype(str)
     df = df.set_index("Dénomination").reindex(DISPLAY_ORDER).fillna(0).reset_index()
-
     for col in ["OPEN", "CLOSE", "RETRAIT", "RESTANT"]:
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
     return df
@@ -286,31 +347,21 @@ def normalize_boite_df_load(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return df_boite_default()
     df = df.copy()
-    rename_map = {
-        "Boite (avant)": "Boîte (avant)",
-        "Depot": "Dépôt",
-        "Dépôt billets": "Dépôt",
-        "Après": "Boîte (après)",
-        "Change": "Change retiré",
-    }
-    df.rename(columns={c: rename_map[c] for c in df.columns if c in rename_map}, inplace=True)
-
+    if "Dépôt" not in df.columns and "Dépôt billets" in df.columns:
+        df.rename(columns={"Dépôt billets": "Dépôt"}, inplace=True)
     if "Dénomination" not in df.columns:
         return df_boite_default()
     for col in ["Boîte (avant)", "Dépôt", "Change retiré", "Boîte (après)"]:
         if col not in df.columns:
             df[col] = 0
-
     df = df[["Dénomination", "Boîte (avant)", "Dépôt", "Change retiré", "Boîte (après)"]]
     df["Dénomination"] = df["Dénomination"].astype(str)
     df = df.set_index("Dénomination").reindex(DISPLAY_ORDER).fillna(0).reset_index()
-
     for col in ["Boîte (avant)", "Dépôt", "Change retiré", "Boîte (après)"]:
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
     return df
 
 
-# LIVE for editor (NO reindex wipe mid-edit)
 def normalize_caisse_df_live(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return df_caisse_default()
@@ -352,15 +403,11 @@ def ensure_state():
         "cashier": "",
         "register_no": 1,
         "target_dollars": 200,
-
         "df_caisse": df_caisse_default(),
         "df_boite": df_boite_default(),
-
         "locked_retrait_caisse": {},
         "locked_withdraw_boite": {},
-
         "boite_allowed": set(["Billet 20 $", "Billet 10 $", "Billet 5 $"] + COINS + ROLLS),
-
         "last_hash_caisse": None,
         "last_hash_boite": None,
     }
@@ -370,7 +417,6 @@ def ensure_state():
 
 ensure_state()
 
-# Load today's saved state once per day
 if st.session_state.booted_for != today:
     st.session_state.booted_for = today
 
@@ -395,7 +441,6 @@ if st.session_state.booted_for != today:
         if isinstance(allowed, list) and allowed:
             st.session_state.boite_allowed = set(allowed)
 
-# Keep in-session tables sane
 st.session_state.df_caisse = normalize_caisse_df_live(st.session_state.df_caisse)
 st.session_state.df_boite = normalize_boite_df_live(st.session_state.df_boite)
 
@@ -435,7 +480,7 @@ with tab_caisse:
         st.session_state.df_caisse,
         hide_index=True,
         use_container_width=True,
-        height=520,
+        height=editor_height(),
         column_config={
             "Dénomination": st.column_config.TextColumn(disabled=True),
             "OPEN": st.column_config.NumberColumn(min_value=0, step=1),
@@ -479,7 +524,6 @@ with tab_caisse:
         )
         restant = sub_counts(close_counts, retrait)
 
-    # Update computed columns in the SAME TABLE
     df = st.session_state.df_caisse.copy()
     df["RETRAIT"] = df["Dénomination"].map(lambda k: safe_int(retrait.get(k, 0)))
     df["RESTANT"] = df["Dénomination"].map(lambda k: safe_int(restant.get(k, 0)))
@@ -506,17 +550,15 @@ with tab_caisse:
         with r1:
             st.caption("Chaque ➖/➕ verrouille la dénomination et recalcule le reste automatiquement.")
 
-        # Inline aligned controller (denom | minus | value | plus | dispo)
         for k in DISPLAY_ORDER:
             mx = safe_int(close_counts.get(k, 0))
             q = safe_int(retrait.get(k, 0))
             c0, c1, c2, c3, c4 = st.columns([2.6, 0.7, 1.0, 0.7, 1.0], vertical_alignment="center")
-            c0.write(k)
+            c0.markdown(f"**{k}**")
             minus = c1.button("➖", key=f"caisse_minus_inline_{k}")
             c2.markdown(f"**{q}**")
             plus = c3.button("➕", key=f"caisse_plus_inline_{k}")
             c4.caption(f"Dispo: {mx}")
-
             if minus or plus:
                 new_locked = dict(st.session_state.locked_retrait_caisse)
                 if k not in new_locked:
@@ -583,7 +625,7 @@ with tab_caisse:
 with tab_boite:
     st.subheader("Boîte (Échange) — Boîte (avant) + Dépôt + Change retiré + Boîte (après) (même tableau)")
 
-    with st.expander("⚙️ Types autorisés pour le change (cocher/décocher)", expanded=True):
+    with st.expander("⚙️ Types autorisés pour le change", expanded=True):
         allowed = set(st.session_state.boite_allowed)
         c1, c2, c3 = st.columns(3)
         cols = [c1, c2, c3]
@@ -595,14 +637,14 @@ with tab_boite:
                 else:
                     allowed.discard(k)
         if not allowed:
-            st.warning("Choisis au moins un type autorisé (sinon impossible).")
+            st.warning("Choisis au moins un type autorisé.")
         st.session_state.boite_allowed = allowed
 
     edited_b = st.data_editor(
         st.session_state.df_boite,
         hide_index=True,
         use_container_width=True,
-        height=520,
+        height=editor_height(),
         column_config={
             "Dénomination": st.column_config.TextColumn(disabled=True),
             "Boîte (avant)": st.column_config.NumberColumn(min_value=0, step=1),
@@ -624,7 +666,7 @@ with tab_boite:
     s1, s2, s3 = st.columns(3)
     s1.info("Boîte (avant): " + cents_to_str(total_before))
     s2.success("Dépôt total: " + cents_to_str(total_deposit))
-    s3.write("**Change à retirer (objectif):** " + f"**{cents_to_str(total_deposit)}**")
+    s3.write("**Change objectif:** " + f"**{cents_to_str(total_deposit)}**")
 
     box_after_deposit = add_counts(box_before, deposit)
 
@@ -650,7 +692,6 @@ with tab_boite:
         )
         box_after = sub_counts(box_after_deposit, withdraw)
 
-    # Update computed columns in SAME TABLE
     df = st.session_state.df_boite.copy()
     df["Change retiré"] = df["Dénomination"].map(lambda k: safe_int(withdraw.get(k, 0)))
     df["Boîte (après)"] = df["Dénomination"].map(lambda k: safe_int(box_after.get(k, 0)))
@@ -679,18 +720,16 @@ with tab_boite:
         with r1:
             st.caption("Chaque ➖/➕ verrouille la dénomination et recalcule le reste automatiquement.")
 
-        # Inline aligned controller ONLY for allowed denoms
         allowed_sorted = [k for k in DISPLAY_ORDER if k in st.session_state.boite_allowed]
         for k in allowed_sorted:
             mx = safe_int(box_after_deposit.get(k, 0))
             q = safe_int(withdraw.get(k, 0))
             c0, c1, c2, c3, c4 = st.columns([2.6, 0.7, 1.0, 0.7, 1.0], vertical_alignment="center")
-            c0.write(k)
+            c0.markdown(f"**{k}**")
             minus = c1.button("➖", key=f"boite_minus_inline_{k}")
             c2.markdown(f"**{q}**")
             plus = c3.button("➕", key=f"boite_plus_inline_{k}")
             c4.caption(f"Dispo: {mx}")
-
             if minus or plus:
                 new_locked = dict(st.session_state.locked_withdraw_boite)
                 if k not in new_locked:
@@ -702,7 +741,6 @@ with tab_boite:
                 st.session_state.locked_withdraw_boite = new_locked
                 st.rerun()
 
-    # Receipt rows
     rows_boite = []
     for k in DISPLAY_ORDER:
         rows_boite.append({
@@ -767,7 +805,7 @@ with tab_boite:
 # ================== TAB: SAUVEGARDE ==================
 with tab_save:
     st.subheader("Sauvegarde & reçus")
-    st.caption("Liste simple (date + titre). Clique pour ouvrir. Caisse et Boîte sont séparés.")
+    st.caption("Liste simple. Caisse et Boîte sont séparés.")
 
     colA, colB = st.columns(2)
 
@@ -783,30 +821,16 @@ with tab_save:
                     html, _ = load_receipt(DIR_CAISSE, d)
                     rp = os.path.join(DIR_CAISSE, f"{ds}_receipt.html")
                     sp = os.path.join(DIR_CAISSE, f"{ds}_state.json")
-
                     if html:
                         components.html(html, height=640, scrolling=True)
                     else:
                         st.warning("Reçu introuvable pour cette date.")
-
                     if os.path.exists(rp):
                         with open(rp, "rb") as f:
-                            st.download_button(
-                                "⬇️ Télécharger reçu (HTML)",
-                                data=f.read(),
-                                file_name=os.path.basename(rp),
-                                mime="text/html",
-                                key=f"dl_caisse_html_{ds}",
-                            )
+                            st.download_button("⬇️ Télécharger reçu (HTML)", f.read(), os.path.basename(rp), "text/html", key=f"dl_caisse_html_{ds}")
                     if os.path.exists(sp):
                         with open(sp, "rb") as f:
-                            st.download_button(
-                                "⬇️ Télécharger état (JSON)",
-                                data=f.read(),
-                                file_name=os.path.basename(sp),
-                                mime="application/json",
-                                key=f"dl_caisse_json_{ds}",
-                            )
+                            st.download_button("⬇️ Télécharger état (JSON)", f.read(), os.path.basename(sp), "application/json", key=f"dl_caisse_json_{ds}")
 
     with colB:
         st.markdown("## 🪙 Boîte (Échange)")
@@ -820,27 +844,13 @@ with tab_save:
                     html, _ = load_receipt(DIR_BOITE, d)
                     rp = os.path.join(DIR_BOITE, f"{ds}_receipt.html")
                     sp = os.path.join(DIR_BOITE, f"{ds}_state.json")
-
                     if html:
                         components.html(html, height=640, scrolling=True)
                     else:
                         st.warning("Reçu introuvable pour cette date.")
-
                     if os.path.exists(rp):
                         with open(rp, "rb") as f:
-                            st.download_button(
-                                "⬇️ Télécharger reçu (HTML)",
-                                data=f.read(),
-                                file_name=os.path.basename(rp),
-                                mime="text/html",
-                                key=f"dl_boite_html_{ds}",
-                            )
+                            st.download_button("⬇️ Télécharger reçu (HTML)", f.read(), os.path.basename(rp), "text/html", key=f"dl_boite_html_{ds}")
                     if os.path.exists(sp):
                         with open(sp, "rb") as f:
-                            st.download_button(
-                                "⬇️ Télécharger état (JSON)",
-                                data=f.read(),
-                                file_name=os.path.basename(sp),
-                                mime="application/json",
-                                key=f"dl_boite_json_{ds}",
-                            )
+                            st.download_button("⬇️ Télécharger état (JSON)", f.read(), os.path.basename(sp), "application/json", key=f"dl_boite_json_{ds}")
